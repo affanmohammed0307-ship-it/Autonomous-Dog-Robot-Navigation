@@ -1,0 +1,810 @@
+#include <WiFi.h>
+#include <WebServer.h>       
+#include <TinyGPSPlus.h>
+#include <HardwareSerial.h>
+#include <ArduinoJson.h>    
+#include <Preferences.h>    
+#include <math.h>           
+#include <Wire.h>          
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BNO055.h>
+#include <utility/imumaths.h>
+
+// ===================================================
+// === CONFIG & OBJECTS (Map/Sensor-Related) ===
+// ===================================================
+
+const char* ssid = "ESP32_CAM_AP";      // Your WiFi SSID
+const char* password = "12345678";      // Your WiFi Password
+
+// BNO055 IMU Setup
+#define I2C_SCL_PIN 22
+#define I2C_SDA_PIN 21  
+Adafruit_BNO055 bno = Adafruit_BNO055(55, 0x28);  
+bool bno_initialized = false;
+
+// GPS Setup
+static const int GPS_RX_PIN = 16;  
+static const int GPS_TX_PIN = 17;  
+static const uint32_t GPSBaud = 9600;  
+TinyGPSPlus gps;
+HardwareSerial gpsSerial(2); 
+
+// Web Server
+WebServer server(80);
+
+// === Dead Reckoning (DR) & IMU State (CRITICAL) ===
+float estimatedPosX = 0.0; 
+float estimatedPosY = 0.0; 
+float estimatedVelX = 0.0; 
+float estimatedVelY = 0.0; 
+float currentHeading = 0.0; 
+float currentLAx = 0.0;    
+float currentLAy = 0.0;    
+
+float currentLat = 0.0;     
+float currentLng = 0.0;     
+uint8_t sys_cal = 0; // Calibration Status
+unsigned long lastDRUpdate = 0; 
+const float DR_UPDATE_INTERVAL_MS = 50.0; // 20Hz Update Rate
+
+// === NEW: YAW OFFSET & DRIFT COMPENSATION ===
+float globalYawOffset = 0.0; // The BNO's absolute heading that corresponds to the map's 0 degrees (North).
+
+// *** CRITICAL DRIFT REDUCTION CONSTANTS (Restored for Smoothness) ***
+const float ACCEL_THRESHOLD = 0.1;     // Restored from 0.15 for smoother low-speed movement.
+const float VELOCITY_DAMPING = 0.95;   // Restored from 0.90 for smoother velocity decay.
+const float STATIC_POS_DAMPING = 0.9995; // Restored from 0.99 for less aggressive static position snap.
+// ============================================
+
+// === Map & Anchor State (NVS) ===
+bool anchorSet = false;
+float anchorLat = 0.0;
+float anchorLng = 0.0;
+String mapBlocksJson = "[]"; 
+const size_t JSON_DOC_SIZE = 2048; 
+int nextBlockIndex = 1; 
+
+// === Preferences Configuration ===
+Preferences preferences; 
+const char* NVS_NAMESPACE = "map_config"; 
+const char* NVS_ANCHOR_LAT_KEY = "anchor_lat";
+const char* NVS_ANCHOR_LNG_KEY = "anchor_lng";
+const char* NVS_MAP_BLOCKS_KEY = "map_blocks";
+const char* NVS_YAW_OFFSET_KEY = "yaw_offset";
+
+
+// ===================================================
+// === FORWARD DECLARATIONS (CRITICAL FOR COMPILE) ===
+// ===================================================
+
+void readIMU();
+void readGPS();
+void updateDeadReckoning();
+
+// Web Server Handlers
+void handleRoot();
+void handleData();
+void handleMap();
+void handleMapData();
+void handleSetAnchor(); 
+void handleAddBlock(); 
+void handleNewBlock(); 
+void handleClearBlocks(); 
+void handleResetDRPosition(); 
+
+
+// ===================================================
+// === SENSOR & UTILITY FUNCTIONS (FULL) ===
+// ===================================================
+
+/**
+ * @brief Reads BNO055 IMU, updates Heading and Linear Acceleration (crucial for DR).
+ */
+void readIMU() {
+  if (bno_initialized) {
+    sensors_event_t event;
+    bno.getEvent(&event);
+    
+    float rawHeading = event.orientation.x; 
+
+    // 1. CRITICAL: Apply Global Offset to make current forward direction 0 degrees (Local North)
+    float correctedHeading = rawHeading - globalYawOffset;
+
+    // 2. Normalize corrected heading (0 to 360)
+    if (correctedHeading < 0) { correctedHeading += 360.0; }
+    else if (correctedHeading >= 360) { correctedHeading -= 360.0; }
+
+    currentHeading = correctedHeading; // This is the value used by DR/Map
+    
+    // Linear Acceleration (Used for Dead Reckoning)
+    imu::Vector<3> linear_accel_vec = bno.getVector(Adafruit_BNO055::VECTOR_LINEARACCEL);
+    currentLAx = linear_accel_vec.x();  
+    currentLAy = linear_accel_vec.y();  
+    
+    // Update calibration status (minimal)
+    uint8_t gyro_cal, accel_cal, mag_cal;
+    bno.getCalibration(&sys_cal, &gyro_cal, &accel_cal, &mag_cal);
+  }
+}
+
+/**
+ * @brief Performs Dead Reckoning using Linear Acceleration and Heading.
+ * (Modified for Quadrant Fix and Restored Smooth Damping)
+ */
+void updateDeadReckoning() {
+    if (!bno_initialized) return;
+
+    unsigned long now = millis();
+    if (now - lastDRUpdate < DR_UPDATE_INTERVAL_MS) {
+        return; 
+    }
+    
+    float dt = (float)(now - lastDRUpdate) / 1000.0f; 
+    lastDRUpdate = now;
+    
+    float accelX = currentLAx; 
+    float accelY = currentLAy; 
+    
+    const float VEL_POS_THRESHOLD = 0.05; // 5 cm/s
+    
+    // 1. Update velocity (Euler Integration + Damping)
+    if (abs(accelX) > ACCEL_THRESHOLD) { 
+        estimatedVelX += accelX * dt; 
+    } else { 
+        estimatedVelX *= VELOCITY_DAMPING; // Milder Damping
+    } 
+    
+    if (abs(accelY) > ACCEL_THRESHOLD) { 
+        estimatedVelY += accelY * dt; 
+    } else { 
+        estimatedVelY *= VELOCITY_DAMPING; // Milder Damping
+    } 
+    
+    // --- DR Stabilization (Velocity and Position Damping) ---
+    if (abs(estimatedVelX) < VEL_POS_THRESHOLD && abs(estimatedVelY) < VEL_POS_THRESHOLD) {
+        estimatedVelX = 0.0;
+        estimatedVelY = 0.0;
+        // Light damping/friction for static drift
+        estimatedPosX *= STATIC_POS_DAMPING; 
+        estimatedPosY *= STATIC_POS_DAMPING;
+    }
+    
+    // 2. Convert robot-frame velocity to global-frame velocity (Rotation) - Uses the corrected currentHeading
+    float headingRad = (currentHeading) * DEG_TO_RAD;
+    float cosH = cos(headingRad);
+    float sinH = sin(headingRad);
+    
+    // DR Model: Y-axis is Forward (North), X-axis is Right (East)
+    float globalVelY = (estimatedVelX * cosH) - (estimatedVelY * sinH); 
+    float globalVelX = (estimatedVelX * sinH) + (estimatedVelY * cosH); 
+    
+    // 3. Update position
+    // *** CRITICAL FIX: Negate to correct for 3rd Quadrant issue (KEEP THIS) ***
+    estimatedPosX += (-globalVelX) * dt; 
+    estimatedPosY += (-globalVelY) * dt; 
+}
+
+/**
+ * @brief Reads GPS serial data, updates currentLat/Lng.
+ */
+void readGPS() {
+  while (gpsSerial.available() > 0) {
+    if (gps.encode(gpsSerial.read())) {
+      if (gps.location.isValid()) {
+        currentLat = gps.location.lat();
+        currentLng = gps.location.lng();
+      }
+    }
+  }
+}
+
+void saveConfig() {
+    if (preferences.begin(NVS_NAMESPACE, false)) { 
+        preferences.putFloat(NVS_ANCHOR_LAT_KEY, anchorLat);
+        preferences.putFloat(NVS_ANCHOR_LNG_KEY, anchorLng);
+        preferences.putString(NVS_MAP_BLOCKS_KEY, mapBlocksJson);
+        preferences.putFloat(NVS_YAW_OFFSET_KEY, globalYawOffset); // Save the offset
+        preferences.end();
+    }
+}
+
+void gpsToLocalXY(float lat, float lng, float anchorLat, float anchorLng, float* x_out, float* y_out) {
+    if (!anchorSet) {
+        *x_out = 0.0; *y_out = 0.0; return;
+    }
+    
+    float dx_m = TinyGPSPlus::distanceBetween(lat, lng, lat, anchorLng);
+    float dy_m = TinyGPSPlus::distanceBetween(lat, lng, anchorLat, lng);
+
+    if (lng < anchorLng) { dx_m = -dx_m; } 
+    if (lat < anchorLat) { dy_m = -dy_m; } 
+    
+    *x_out = dx_m;
+    *y_out = dy_m;
+}
+
+// ===================================================
+// === WEB SERVER HANDLERS (Map Focused) ===
+// ===================================================
+
+void handleClearBlocks() {
+    mapBlocksJson = "[]"; 
+    nextBlockIndex = 1;
+    saveConfig(); 
+    server.send(200, "text/plain", "All Map Blocks Cleared.");
+}
+
+void handleSetAnchor() {
+    // 1. Get current RAW IMU reading
+    sensors_event_t event;
+    bno.getEvent(&event);
+
+    // 2. CRITICAL FIX: Save the raw IMU value as the new offset (Local North Lock)
+    globalYawOffset = event.orientation.x; 
+
+    // 3. Set a dummy Anchor GPS value if none exists yet (required by TinyGPSPlus math).
+    if (!anchorSet) {
+         anchorLat = 40.7128; // Dummy arbitrary coordinate for math to work
+         anchorLng = -74.0060;
+         anchorSet = true;
+    }
+
+    // 4. Reset DR to (0, 0)
+    estimatedPosX = 0.0; 
+    estimatedPosY = 0.0;
+    estimatedVelX = 0.0; 
+    estimatedVelY = 0.0;
+    
+    saveConfig(); 
+    
+    server.send(200, "text/plain", "Local Origin (0,0) Set: Yaw Offset Locked to current heading.");
+}
+
+void handleNewBlock() {
+    StaticJsonDocument<JSON_DOC_SIZE> doc; 
+    DeserializationError error = deserializeJson(doc, mapBlocksJson);
+    JsonArray array = doc.is<JsonArray>() ? doc.as<JsonArray>() : doc.to<JsonArray>(); 
+    
+    String newLabel;
+    do {
+        newLabel = "Block" + String(nextBlockIndex++);
+        bool exists = false;
+        for (JsonObject block : array) {
+            if (block["label"].as<String>().equals(newLabel)) {
+                exists = true;
+                break;
+            }
+        }
+        if (!exists) break;
+    } while(nextBlockIndex < 100); 
+
+    JsonObject newBlock = array.createNestedObject();
+    newBlock["label"] = newLabel;
+    newBlock.createNestedArray("corners");
+    
+    mapBlocksJson.clear();
+    serializeJson(doc, mapBlocksJson);
+    saveConfig(); 
+    
+    server.send(200, "application/json", "{\"label\":\"" + newLabel + "\"}");
+}
+
+
+void handleAddBlock() {
+    if (!anchorSet) { server.send(400, "text/plain", "Error: Set Local Origin (0,0) first."); return; }
+    
+    float blockX, blockY;
+    
+    // Determine whether to use high-trust GPS data or low-trust DR position
+    bool useGPS = gps.location.isValid() && (currentLat != 0.0 || currentLng != 0.0);
+
+    if (useGPS) {
+        gpsToLocalXY(currentLat, currentLng, anchorLat, anchorLng, &blockX, &blockY);
+        // Note: For advanced mapping, you would adjust DR values toward GPS, but for now we trust GPS Fix for new points
+    } else {
+        blockX = estimatedPosX;
+        blockY = estimatedPosY;
+    }
+
+    String label = server.arg("label");
+    if (label == "") { label = "Block"; }
+
+    StaticJsonDocument<JSON_DOC_SIZE> doc; 
+    DeserializationError error = deserializeJson(doc, mapBlocksJson);
+    JsonArray array = doc.is<JsonArray>() ? doc.as<JsonArray>() : doc.to<JsonArray>();
+    
+    JsonObject targetBlock = JsonObject();
+    for (JsonObject block : array) {
+        if (block["label"].as<String>().equals(label)) {
+            targetBlock = block;
+            break;
+        }
+    }
+    
+    if (targetBlock.isNull()) {
+        targetBlock = array.createNestedObject();
+        targetBlock["label"] = label;
+        targetBlock.createNestedArray("corners");
+    }
+    
+    JsonArray corners = targetBlock["corners"].as<JsonArray>();
+    JsonObject corner = corners.createNestedObject();
+    corner["x"] = blockX;
+    corner["y"] = blockY;
+    
+    mapBlocksJson.clear();
+    serializeJson(doc, mapBlocksJson);
+    
+    saveConfig(); 
+
+    server.send(200, "text/plain", "Corner added to " + label + " at local position (X: " + String(blockX, 2) + ", Y: " + String(blockY, 2) + ").");
+}
+
+void handleMapData() {
+    
+    bool gpsFixed = gps.location.isValid() && (currentLat != 0.0 || currentLng != 0.0);
+    
+    StaticJsonDocument<JSON_DOC_SIZE> doc;
+    
+    // DR/IMU State
+    doc["DR_X"] = estimatedPosX;
+    doc["DR_Y"] = estimatedPosY;
+    doc["Heading"] = currentHeading; 
+    doc["Cal_S"] = sys_cal; 
+
+    // GPS/Anchor State
+    doc["Latitude"] = currentLat;
+    doc["Longitude"] = currentLng;
+    doc["GPSFixed"] = gpsFixed;
+    doc["AnchorSet"] = anchorSet;
+    doc["AnchorLat"] = anchorLat;
+    doc["AnchorLng"] = anchorLng;
+    
+    // Block State
+    doc["NextBlockIndex"] = nextBlockIndex; 
+
+    // Embed MapBlocks JSON
+    DeserializationError err = deserializeJson(doc["MapBlocks"], mapBlocksJson);
+    if (err) { doc["MapBlocks"] = JsonArray(); }
+    
+    String jsonOutput;
+    serializeJson(doc, jsonOutput);
+    server.send(200, "application/json", jsonOutput);
+}
+
+// CRITICAL FIX: Reset DR button handler
+void handleResetDRPosition() {
+    estimatedPosX = 0.0;
+    estimatedPosY = 0.0;
+    estimatedVelX = 0.0; 
+    estimatedVelY = 0.0;
+    
+    server.send(200, "text/plain", "DR Position Reset to (0,0).");
+}
+
+
+void handleRoot() { server.send(200, "text/plain", "Use /map for the map page."); }
+void handleData() { server.send(200, "application/json", "{}"); } 
+
+// --- HTML Content for the Map Page (100x100m and Permanent Dark Mode) ---
+void handleMap() {
+    const char* mapHtmlContent = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>LOCAL XY MAP</title>
+    <style>
+        body { 
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;  text-align: center;  margin-top: 20px;  
+            background-color: #121212; color: #e0e0e0;
+        }
+        h1 { color: #69f0ae; margin-bottom: 20px; }
+        .map-container {
+            width: 500px; /* 100m at 5px/m */
+            height: 500px;
+            margin: 20px auto;
+            border: 2px solid #444;
+            background-color: #1e1e1e;
+            position: relative;
+        }
+        #localMapCanvas { display: block; margin: 0 auto; background-color: #1e1e1e; }
+        .controls {
+            margin-top: 20px; padding: 15px; border: 1px solid #444; border-radius: 8px;
+            display: inline-block; background-color: #1e1e1e;
+        }
+        .controls input, .controls button, .controls select {
+            padding: 8px; margin: 5px; border-radius: 4px; border: 1px solid #555;
+            background-color: #333; color: #e0e0e0;
+        }
+        .btn-anchor { background-color: #03a9f4; color: white; cursor: pointer; }
+        .btn-reset-dr { background-color: orange; color: black; cursor: pointer; }
+        .btn-new { background-color: #69f0ae; color: #121212; cursor: pointer; }
+        .btn-block { background-color: #ffeb3b; color: #121212; cursor: pointer; }
+        .btn-clear { background-color: #f44336; color: white; cursor: pointer; }
+        .data-display { margin-top: 15px; font-weight: bold; }
+        .gps-status { color: #f44336; }
+        #anchor-set { color: #f44336; }
+        .coordinate-list-container {
+            width: 500px; margin: 20px auto; text-align: left; border: 1px solid #444; padding: 15px; border-radius: 8px; background-color: #1e1e1e;
+        }
+        .coordinate-list-container h3 {
+             border-bottom: 1px solid #333; padding-bottom: 5px; margin-top: 0; font-size: 1.1em; color: #69f0ae;
+        }
+        .block-entry { margin-bottom: 10px; border-left: 3px solid #03a9f4; padding-left: 8px; }
+        .corner-point { font-size: 0.9em; margin-left: 10px; }
+    </style>
+</head>
+<body class="dark-mode"> 
+    <h1>Local X/Y Fixed Map (DR Calibration)</h1>
+
+    <div class="data-display">
+        Anchor Set: <span id="anchor-set">NO</span> | GPS: <span id="gps-status" class="gps-status">NO FIX</span><br>
+        DR Position: (<span id="dr-x">0.00</span> m, <span id="dr-y">0.00</span> m) | Heading (Local): <span id="heading">0.00</span> deg
+    </div>
+
+    <div class="controls">
+        <p>1. DR CALIBRATION (Point robot North/Forward and click)</p>
+        <button class="btn-anchor" onclick="setAnchor()">SET LOCAL ORIGIN (0,0) & LOCK YAW</button>
+        <button class="btn-reset-dr" onclick="resetDRPosition()">RESET DR POSITION & PATH</button>
+        
+        <p style="margin-top:10px;">2. Map Block Creation</p>
+        <button class="btn-new" onclick="newBlock()">NEW BLOCK</button>
+        <input type="text" id="block-label" placeholder="Current Block Label" value="Block1" style="width:150px;">
+        <button class="btn-block" onclick="addBlock()">ADD BLOCK POINT</button>
+        <button class="btn-clear" onclick="clearBlocks()">CLEAR ALL BLOCKS</button>
+    </div>
+
+    <div class="map-container">
+        <canvas id="localMapCanvas" width="500" height="500"></canvas>
+    </div>
+    
+    <div class="coordinate-list-container">
+        <h3>Saved Block Coordinates (X, Y in meters)</h3>
+        <div id="block-coordinates-list">
+            No blocks saved.
+        </div>
+    </div>
+
+    <script>
+        const POLLING_RATE = 200; // 200ms update rate (5Hz) - CRITICAL FOR SMOOTH DR
+        const CANVAS_SIZE = 500;
+        const CENTER = CANVAS_SIZE / 2;
+        const PIXELS_PER_METER = 5; // 5px/m -> 100m x 100m total map area (+/- 50m)
+        const BLOCK_COLORS = ['#ffc107', '#03a9f4', '#69f0ae', '#f44336', '#bb86fc']; // Yellow, Blue, Green, Red, Purple
+
+        // Global context and canvas variables (Initialized in DOMContentLoaded)
+        let ctx;
+        let canvas;
+
+        // Global state mirrors C++ NVS data
+        let mapData = { DR_X: 0, DR_Y: 0, Heading: 0, MapBlocks: [], NextBlockIndex: 1, AnchorSet: false };
+        let pathHistory = [];
+        const MAX_PATH_POINTS = 500;
+
+        // --- Server Interaction Functions ---
+        function sendCommand(url, data) {
+            return fetch(url + (data ? ('?' + new URLSearchParams(data).toString()) : ''))
+                .then(response => {
+                    if (!response.ok) return response.text().then(text => Promise.reject('Error: ' + text));
+                    return response.text();
+                })
+        }
+
+        function setAnchor() {
+            // New logic implements the YAW LOCK (Local North)
+            sendCommand('/setanchor')
+                .then(message => { 
+                    alert("SUCCESS: " + message); 
+                    pathHistory = []; // Clear visual path on reset
+                    updateMapData(); 
+                })
+                .catch(error => alert('Error setting anchor: ' + error));
+        }
+        
+        function resetDRPosition() {
+             // New endpoint handles DR position reset (without affecting Yaw/Anchor)
+             sendCommand('/resetdr') 
+                .then(message => {
+                    alert("DR Position Reset to (0,0). Path Cleared.");
+                    pathHistory = []; // CRITICAL: Clear visual path history on the client
+                    updateMapData();
+                })
+                .catch(error => alert('Error resetting DR: ' + error));
+        }
+
+        function newBlock() {
+             sendCommand('/newblock')
+                .then(response => response.json())
+                .then(data => { 
+                    document.getElementById('block-label').value = data.label;
+                    updateMapData();
+                })
+                .catch(error => alert('Error starting new block: ' + error));
+        }
+
+        function addBlock() {
+            if (!mapData.AnchorSet) { alert('Error: Set Local Origin (0,0) first.'); return; }
+            
+            const label = document.getElementById('block-label').value;
+            if (label === "") { alert("Block Label cannot be empty."); return; }
+            
+            // NOTE: Uses the current DR position if no GPS fix exists
+            sendCommand('/addblock', { label: label })
+                .then(message => { 
+                    alert('SUCCESS: Corner added at X:' + mapData.DR_X.toFixed(2) + ', Y:' + mapData.DR_Y.toFixed(2)); 
+                    updateMapData();
+                })
+                .catch(error => alert('Error adding block: ' + error));
+        }
+        
+        function clearBlocks() {
+            if (confirm("Are you sure you want to clear ALL map blocks? This cannot be undone.")) {
+                 sendCommand('/clearblocks')
+                    .then(message => { 
+                        alert("SUCCESS: " + message); 
+                        updateMapData(); 
+                    })
+                    .catch(error => alert('Error clearing blocks: ' + error));
+            }
+        }
+        
+        // --- Drawing Utilities ---
+        
+        function metersToPixels(x_m, y_m) {
+            const x_px = CENTER + x_m * PIXELS_PER_METER;
+            const y_px = CENTER - y_m * PIXELS_PER_METER; // Y is inverted for screen
+            return { x: x_px, y: y_px };
+        }
+        
+        function drawGrid() {
+            if (!ctx) return;
+            const gridColor = '#333'; const axisColor = '#666';
+            const labelColor = '#ccc'; 
+            
+            ctx.fillStyle = '#1e1e1e';
+            ctx.fillRect(0, 0, CANVAS_SIZE, CANVAS_SIZE);
+
+            for (let m = -50; m <= 50; m += 10) {
+                const px = m * PIXELS_PER_METER;
+                
+                ctx.beginPath();
+                ctx.strokeStyle = '#333'; ctx.lineWidth = 0.5;
+                if (m === 0) { ctx.strokeStyle = axisColor; ctx.lineWidth = 1; }
+                
+                ctx.moveTo(CENTER + px, 0); ctx.lineTo(CENTER + px, CANVAS_SIZE); // Vertical lines (X-axis grid)
+                ctx.moveTo(0, CENTER - px); ctx.lineTo(CANVAS_SIZE, CENTER - px); // Horizontal lines (Y-axis grid)
+                ctx.stroke();
+                
+                if (m !== 0) {
+                    ctx.fillStyle = labelColor; ctx.font = '10px Arial';
+                    ctx.fillText(m + 'm(E/W)', CENTER + px + 2, CENTER + 15);
+                    ctx.fillText(m + 'm(N/S)', 5, CENTER - px + 5);
+                }
+            }
+            ctx.fillStyle = '#03a9f4'; ctx.fillText('ANCHOR (0,0)', CENTER + 5, CENTER - 5);
+        }
+        
+        function drawBlockPolygon(block, index) {
+            if (!ctx || !block.corners || block.corners.length === 0) return;
+
+            const color = BLOCK_COLORS[index % BLOCK_COLORS.length];
+            const fillColor = color.replace(')', ', 0.3)').replace('rgb(', 'rgba('); 
+            const numCorners = block.corners.length;
+            
+            // 1. Draw Polygon Body (Path)
+            ctx.beginPath();
+            let startPoint = metersToPixels(block.corners[0].x, block.corners[0].y);
+            ctx.moveTo(startPoint.x, startPoint.y);
+
+            for (let i = 1; i < numCorners; i++) {
+                let currentPoint = metersToPixels(block.corners[i].x, block.corners[i].y);
+                ctx.lineTo(currentPoint.x, currentPoint.y);
+            }
+            
+            if (numCorners >= 3) {
+                ctx.closePath();
+                ctx.fillStyle = fillColor; ctx.fill();
+            }
+
+            // 2. Draw Outline
+            ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.stroke();
+            
+            // 3. Draw Corner Points and Label
+            block.corners.forEach(corner => {
+                 let point = metersToPixels(corner.x, corner.y);
+                 ctx.fillStyle = 'white';
+                 ctx.beginPath();
+                 ctx.arc(point.x, point.y, 4, 0, 2 * Math.PI);
+                 ctx.fill();
+                 ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.stroke();
+            });
+
+            ctx.fillStyle = 'white'; ctx.font = '14px Arial';
+            ctx.fillText(block.label, startPoint.x + 8, startPoint.y - 8);
+        }
+
+        function drawMap() {
+            if (!ctx) return; // Fail-safe
+            
+            drawGrid();
+
+            // 1. Draw Fixed Map Blocks
+            if (Array.isArray(mapData.MapBlocks)) {
+                 mapData.MapBlocks.forEach((block, index) => drawBlockPolygon(block, index));
+            }
+            
+            // 2. Draw Robot Path History
+            const { x: robot_x_px, y: robot_y_px } = metersToPixels(mapData.DR_X, mapData.DR_Y);
+            
+            // Only plot path if DR is active (has moved beyond 0,0 OR history exists)
+            if (mapData.DR_X !== 0 || mapData.DR_Y !== 0 || pathHistory.length > 0) {
+                 pathHistory.push({ x: robot_x_px, y: robot_y_px });
+                 if (pathHistory.length > MAX_PATH_POINTS) { pathHistory.shift(); }
+            }
+
+            ctx.beginPath(); 
+            ctx.strokeStyle = '#f39c12'; ctx.lineWidth = 3; // Orange path line
+            if (pathHistory.length > 0) {
+                ctx.moveTo(pathHistory[0].x, pathHistory[0].y);
+                for (let i = 1; i < pathHistory.length; i++) { ctx.lineTo(pathHistory[i].x, pathHistory[i].y); }
+            }
+            ctx.stroke();
+
+            // 3. Draw Robot Position (Circle + Heading)
+            const headingDeg = mapData.Heading || 0.0;
+            const headingRad = (90 - headingDeg) * Math.PI / 180; 
+            const arrowLength = 15;
+            
+            // Robot Body
+            ctx.fillStyle = '#f44336'; 
+            ctx.beginPath();
+            ctx.arc(robot_x_px, robot_y_px, 8, 0, 2 * Math.PI);
+            ctx.fill();
+            
+            // Robot Heading Line
+            ctx.strokeStyle = '#ffeb3b'; // Yellow heading line
+            ctx.lineWidth = 4;
+            ctx.beginPath();
+            ctx.moveTo(robot_x_px, robot_y_px);
+            ctx.lineTo(
+                robot_x_px + arrowLength * Math.cos(headingRad),
+                robot_y_px + arrowLength * Math.sin(headingRad)
+            );
+            ctx.stroke();
+        }
+
+        function updateCoordinateList(blocks) {
+            const listEl = document.getElementById('block-coordinates-list');
+            listEl.innerHTML = '';
+            if (!blocks || blocks.length === 0) { listEl.innerHTML = 'No blocks saved.'; return; }
+            
+            blocks.forEach((block, blockIndex) => {
+                let blockHtml = `<div class="block-entry"><strong>${block.label}</strong> (${block.corners.length} corners):<br>`;
+                block.corners.forEach((corner, cornerIndex) => {
+                    blockHtml += `<span class="corner-point">Corner ${cornerIndex + 1}: X: ${corner.x.toFixed(2)}, Y: ${corner.y.toFixed(2)}</span><br>`;
+                });
+                blockHtml += `</div>`;
+                listEl.innerHTML += blockHtml;
+            });
+        }
+
+        function updateMapData() {
+            fetch('/mapdata')
+                .then(response => { if (!response.ok) throw new Error('Network response was not ok'); return response.json(); })
+                .then(data => {
+                    mapData = data;
+                    
+                    // Update UI Status Bar
+                    document.getElementById('dr-x').innerText = data.DR_X.toFixed(2);
+                    document.getElementById('dr-y').innerText = data.DR_Y.toFixed(2);
+                    document.getElementById('heading').innerText = data.Heading.toFixed(2);
+                    
+                    const anchorEl = document.getElementById('anchor-set');
+                    anchorEl.innerText = data.AnchorSet ? 'YES' : 'NO';
+                    anchorEl.style.color = data.AnchorSet ? '#69f0ae' : '#f44336';
+                    
+                    const gpsEl = document.getElementById('gps-status');
+                    gpsEl.innerText = data.GPSFixed ? 'FIX' : 'NO FIX';
+                    gpsEl.style.color = data.GPSFixed ? '#69f0ae' : '#f44336';
+
+                    const blockLabelInput = document.getElementById('block-label');
+                    if (blockLabelInput.value.startsWith("Block") && isNaN(blockLabelInput.value.substring(5))) {
+                         blockLabelInput.value = "Block" + data.NextBlockIndex;
+                    }
+                    
+                    updateCoordinateList(data.MapBlocks);
+                    drawMap(); // CRITICAL DRAW CALL
+                })
+                .catch(error => console.error('Error fetching map data:', error));
+        }
+
+        document.addEventListener('DOMContentLoaded', () => {
+            // CRITICAL FIX: Initialize context only after DOM is ready
+            canvas = document.getElementById('localMapCanvas');
+            ctx = canvas.getContext('2d'); 
+
+            updateMapData(); 
+            // Start the map polling loop (fast rate is key for DR smoothness)
+            setInterval(updateMapData, POLLING_RATE);
+        });
+    </script>
+</body>
+</html>
+)rawliteral";
+    
+    server.send(200, "text/html", mapHtmlContent);
+}
+
+
+void setup() {
+  Serial.begin(115200);  
+
+  // 1. IMU & I2C Setup
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN); 
+  if(bno.begin()) {
+    bno_initialized = true;
+    delay(100);    
+    // Load offset on boot
+    if (preferences.begin(NVS_NAMESPACE, true)) { // Read-only access
+        globalYawOffset = preferences.getFloat(NVS_YAW_OFFSET_KEY, 0.0);
+        preferences.end();
+    }
+    Serial.println("✅ BNO055 IMU initialized.");
+  } else {
+    Serial.println("❌ BNO055 IMU failed. Check power/address.");
+  }
+  
+  // 2. WIFI Setup
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password); 
+  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
+  Serial.print("\n✅ WiFi Connected. Map URL: http://"); Serial.print(WiFi.localIP()); Serial.println("/map");
+
+  // 3. GPS Setup
+  gpsSerial.begin(GPSBaud, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+
+  // 4. Load Anchor/Blocks from Preferences (NVS)
+  if (preferences.begin(NVS_NAMESPACE, true)) { // Read-only access
+      anchorLat = preferences.getFloat(NVS_ANCHOR_LAT_KEY, 0.0);
+      anchorLng = preferences.getFloat(NVS_ANCHOR_LNG_KEY, 0.0);
+      mapBlocksJson = preferences.getString(NVS_MAP_BLOCKS_KEY, "[]");
+      preferences.end();
+  }
+  anchorSet = (anchorLat != 0.0 || anchorLng != 0.0);
+  
+  // Determine nextBlockIndex (for UI label suggestions)
+  StaticJsonDocument<JSON_DOC_SIZE> doc;
+  if (!deserializeJson(doc, mapBlocksJson) && doc.is<JsonArray>()) {
+      for (JsonObject block : doc.as<JsonArray>()) {
+          String label = block["label"].as<String>();
+          if (label.startsWith("Block")) {
+              int index = label.substring(5).toInt();
+              if (index >= nextBlockIndex) { nextBlockIndex = index + 1; }
+          }
+      }
+  } else { nextBlockIndex = 1; }
+
+  // 5. Web Server Setup
+  server.on("/", handleRoot);
+  server.on("/data", HTTP_GET, handleData);
+  server.on("/map", HTTP_GET, handleMap);          
+  server.on("/mapdata", HTTP_GET, handleMapData);  
+  server.on("/setanchor", HTTP_GET, handleSetAnchor); 
+  server.on("/addblock", HTTP_GET, handleAddBlock); 
+  server.on("/newblock", HTTP_GET, handleNewBlock); 
+  server.on("/clearblocks", HTTP_GET, handleClearBlocks); 
+  server.on("/resetdr", HTTP_GET, handleResetDRPosition); 
+  server.begin();
+  
+  lastDRUpdate = millis();
+}
+
+
+void loop() {
+  server.handleClient();
+  readIMU();
+  readGPS();  
+  updateDeadReckoning(); // Actively updating estimatedPosX/Y based on IMU data
+}

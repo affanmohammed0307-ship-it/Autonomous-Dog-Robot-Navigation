@@ -1,0 +1,1606 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <WebSocketsServer.h>
+#include <ArduinoJson.h>
+#include <HardwareSerial.h>
+#include <Wire.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BNO055.h>
+#include <utility/imumaths.h>
+#include <TinyGPSPlus.h> 
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// =======================================================================================
+// =======================================================================================
+// 1. CONFIGURATION
+// =======================================================================================
+// =======================================================================================
+
+const char* ssid     = "ESP32_CAM_AP";
+const char* password = "12345678";
+
+// Initial Compass Offset (Adjustable Live in Web UI)
+int GLOBAL_COMPASS_OFFSET = 180; 
+
+// =======================================================================================
+// 2. HARDWARE PIN DEFINITIONS
+// =======================================================================================
+
+// --- GPS Connections (UART 2) ---
+static const int GPS_RX_PIN = 16;
+static const int GPS_TX_PIN = 17;
+static const uint32_t GPSBaud = 9600;
+
+// --- LIDAR Connections (UART 1) ---
+#define LIDAR_RX_PIN 27 
+#define LIDAR_TX_PIN 33 
+#define LIDAR_BAUDRATE 230400 
+
+// --- ULTRASONIC SENSORS Connections ---
+#define TRIG_FRONT 32
+#define ECHO_FRONT 25
+
+#define TRIG_BACK 5
+#define ECHO_BACK 14
+
+#define TRIG_LEFT 4
+#define ECHO_LEFT 18
+
+#define TRIG_RIGHT 13
+#define ECHO_RIGHT 19
+
+// --- OLED Display Configuration ---
+#define SCREEN_WIDTH 128 
+#define SCREEN_HEIGHT 32 
+#define OLED_RESET -1    
+#define SCREEN_ADDRESS 0x3C 
+
+// =======================================================================================
+// 3. OBJECTS & SERVERS
+// =======================================================================================
+TinyGPSPlus gps; 
+HardwareSerial gpsSerial(2);        // GPS on UART2
+HardwareSerial LidarSerialPort(1);  // LiDAR on UART1
+Adafruit_BNO055 bno = Adafruit_BNO055(55, 0x28);
+
+WebServer server(80);
+WebSocketsServer webSocket = WebSocketsServer(81);
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// =======================================================================================
+// 4. GLOBAL VARIABLES (GPS & NAVIGATION)
+// =======================================================================================
+double currentLat = 0.0;
+double currentLng = 0.0;
+float currentHeading = 0.0; 
+int satCount = 0;
+String navMainStatus = "BOOTING..."; 
+
+// Compass Smoothing Vectors
+double headingSumX = 0.0;
+double headingSumY = 0.0;
+
+// Calibration Data
+uint8_t sysCal = 0, gyroCal = 0, accelCal = 0, magCal = 0;
+
+// Active Target (Received from Browser A* Pathfinding)
+int activeTargetID = -1; // -1 = Idle
+double targetLat = 0.0;
+double targetLng = 0.0;
+double distToTarget = 0.0;
+
+// --- NEW GLOBAL: Stores the instruction from the webpage to display on OLED ---
+String webDirectionInstruction = "BOOTING..."; 
+// =======================================================================================
+
+// =======================================================================================
+// 5. GLOBAL VARIABLES (LIDAR, ULTRA, SAFETY FSM)
+// =======================================================================================
+
+// Filter Constants (mm)
+const int LIDAR_MIN_MM = 1000;
+const int LIDAR_MAX_MM = 5000;
+const int ULTRA_MIN_MM = 500; 
+const int ULTRA_MAX_MM = 2500; 
+
+// Critical Safety Ranges (mm) - FROM CODE 2
+const int CRITICAL_FRONT_MAX_MM = 2000; // 200cm
+const int CRITICAL_STOP_MIN_MM = 1;   
+const int CRITICAL_STOP_MAX_MM = 2000;  
+const int CRITICAL_BACK_MIN_MM = 1;
+const int CRITICAL_BACK_MAX_MM = 100;
+
+// Timers
+const unsigned long STOP_DURATION_MS = 5000;
+const unsigned long STEP_ACTION_DURATION_MS = 5000;
+const int STATUS_BROADCAST_INTERVAL = 100;
+unsigned long lastStatusBroadcastTime = 0;
+
+// FSM States
+enum RobotState { 
+    STATE_IDLE, 
+    STATE_STOP_TIMER, 
+    STATE_STEP_ACTION 
+};
+
+RobotState currentState = STATE_IDLE;
+unsigned long actionStartTime = 0;
+const char* stepDirection = "NONE"; 
+
+// Lidar Clustering
+const int CLUSTER_N_POINTS = 3; 
+const int CLUSTER_MAX_DIFF_MM = 100; 
+int lastLidarDistances[CLUSTER_N_POINTS] = {0};
+int lidarBufferIndex = 0;
+
+// Channel Logic Variables (Diagonals)
+long dist_FrontRight = 6000; 
+long dist_FrontLeft = 6000; 
+long dist_BackLeft = 6000;  
+long dist_BackRight = 6000; 
+String channelNavCommand = "NAV: STRAIGHT"; 
+
+// Ultrasonic Data Structure
+struct UltrasonicSensor { 
+    const char* id; 
+    int trigPin; 
+    int echoPin; 
+    float angle; 
+    long* lastDistance;
+};
+
+long ultraLastDistances[4] = {0};
+
+UltrasonicSensor sensors[] = {
+  {"FRONT", TRIG_FRONT, ECHO_FRONT, 90.0, &ultraLastDistances[0]},
+  {"BACK", TRIG_BACK, ECHO_BACK, 270.0, &ultraLastDistances[1]},
+  {"LEFT", TRIG_LEFT, ECHO_LEFT, 180.0, &ultraLastDistances[2]},
+  {"RIGHT", TRIG_RIGHT, ECHO_RIGHT, 0.0, &ultraLastDistances[3]}
+};
+
+const int NUM_SENSORS = 4;
+const int ultraScanInterval = 20; 
+unsigned long lastUltraScanTime = 0;
+int currentUltraSensor = 0; 
+
+// =======================================================================================
+// =======================================================================================
+// 6. HELPER FUNCTIONS: GPS & COMPASS
+// =======================================================================================
+// =======================================================================================
+
+void updateFilteredGPS(double rawLat, double rawLng) {
+    if (currentLat == 0.0) {
+        currentLat = rawLat;
+        currentLng = rawLng;
+        return;
+    }
+
+    // Teleportation Check (15m Jump limit)
+    double jumpDist = TinyGPSPlus::distanceBetween(currentLat, currentLng, rawLat, rawLng);
+    if (jumpDist > 15.0) return; 
+
+    // Low Pass Filter (30% new, 70% old)
+    float alpha = 0.3; 
+    currentLat = (currentLat * (1.0 - alpha)) + (rawLat * alpha);
+    currentLng = (currentLng * (1.0 - alpha)) + (rawLng * alpha);
+}
+
+void updateSmoothedHeading(float rawHeading) {
+    // Vector averaging to handle 0-360 wrap-around smoothly
+    double rad = rawHeading * DEG_TO_RAD;
+    double x = cos(rad);
+    double y = sin(rad);
+
+    // Exponential Moving Average on vectors
+    float alpha = 0.2; // Smoothing factor
+    headingSumX = (headingSumX * (1.0 - alpha)) + (x * alpha);
+    headingSumY = (headingSumY * (1.0 - alpha)) + (y * alpha);
+
+    // Convert back to degrees
+    currentHeading = atan2(headingSumY, headingSumX) * RAD_TO_DEG;
+    if (currentHeading < 0) currentHeading += 360;
+}
+
+// =======================================================================================
+// =======================================================================================
+// 7. HELPER FUNCTIONS: SENSORS (LIDAR + ULTRA)
+// =======================================================================================
+// =======================================================================================
+
+bool isClusteredThreat(int currentDistance) { 
+    lastLidarDistances[lidarBufferIndex] = currentDistance;
+    lidarBufferIndex = (lidarBufferIndex + 1) % CLUSTER_N_POINTS;
+
+    int min_dist = 6000;
+    int max_dist = 0;
+    bool buffer_filled = true;
+
+    for (int i = 0; i < CLUSTER_N_POINTS; i++) {
+        if (lastLidarDistances[i] == 0) {
+            buffer_filled = false;
+            break;  
+        }
+        if (lastLidarDistances[i] < min_dist) min_dist = lastLidarDistances[i];
+        if (lastLidarDistances[i] > max_dist) max_dist = lastLidarDistances[i];
+    }
+    
+    if (!buffer_filled) return false;
+
+    return (max_dist - min_dist) <= CLUSTER_MAX_DIFF_MM;
+}
+
+long measureUltrasonic(int trigPin, int echoPin) { 
+  digitalWrite(trigPin, LOW); delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH); delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+  long duration = pulseIn(echoPin, HIGH, 25000);  
+  if (duration == 0) return 0;  
+  long dist = (duration * 17) / 100;  // mm
+  return dist;  
+}
+
+// Critical Range Checks
+bool isCriticallyBlockedFront(long dist) { 
+    return dist > 0 && dist >= CRITICAL_STOP_MIN_MM && dist <= CRITICAL_FRONT_MAX_MM; 
+}
+
+bool isCriticallyBlockedSide(long dist) { 
+    return dist > 0 && dist >= CRITICAL_STOP_MIN_MM && dist <= CRITICAL_STOP_MAX_MM; 
+}
+
+bool isCriticallyBlockedBack(long dist) { 
+    return dist > 0 && dist >= CRITICAL_BACK_MIN_MM && dist <= CRITICAL_BACK_MAX_MM; 
+}
+
+// =======================================================================================
+// =======================================================================================
+// 8. LOGIC: CHANNEL NAVIGATION (MIRROR PROOF)
+// =======================================================================================
+// =======================================================================================
+
+void calculateChannelNavigation() {
+    
+    // --- 1. Get Reliable Side Data (Ultrasonic) ---
+    long ultraLeft = *sensors[2].lastDistance;  // Left Sensor
+    long ultraRight = *sensors[3].lastDistance; // Right Sensor
+    
+    // Check if ultra reading is valid (50cm to 250cm)
+    bool trustLeft = (ultraLeft >= ULTRA_MIN_MM && ultraLeft <= ULTRA_MAX_MM);
+    bool trustRight = (ultraRight >= ULTRA_MIN_MM && ultraRight <= ULTRA_MAX_MM);
+
+    // Calculate a safe diagonal distance based on the side ultrasonic
+    long safeDiagLeft = (long)(ultraLeft * 1.414);
+    long safeDiagRight = (long)(ultraRight * 1.414);
+
+
+    // --- 2. Process FRONT-LEFT and BACK-LEFT (The "Left Push") ---
+    long valFL, valBL;
+    
+    // Front Left (135 deg)
+    long rawFL = (dist_FrontLeft > 0) ? dist_FrontLeft : 6000; 
+    if (trustLeft && safeDiagLeft < rawFL) {
+        valFL = safeDiagLeft; // Ultrasonic override for mirror
+    } else {
+        valFL = rawFL;
+    }
+
+    // Back Left (225 deg)
+    long rawBL = (dist_BackLeft > 0) ? dist_BackLeft : 6000; 
+    if (trustLeft && safeDiagLeft < rawBL) {
+        valBL = safeDiagLeft; // Ultrasonic override for mirror
+    } else {
+        valBL = rawBL;
+    }
+
+
+    // --- 3. Process FRONT-RIGHT and BACK-RIGHT (The "Right Push") ---
+    long valFR, valBR;
+    
+    // Front Right (45 deg)
+    long rawFR = (dist_FrontRight > 0) ? dist_FrontRight : 6000; 
+    if (trustRight && safeDiagRight < rawFR) {
+        valFR = safeDiagRight; // Ultrasonic override for mirror
+    } else {
+        valFR = rawFR;
+    }
+
+    // Back Right (315 deg)
+    long rawBR = (dist_BackRight > 0) ? dist_BackRight : 6000; 
+    if (trustRight && safeDiagRight < rawBR) {
+        valBR = safeDiagRight; // Ultrasonic override for mirror
+    } else {
+        valBR = rawBR;
+    }
+
+
+    // --- 4. Calculate The "Push" (Center the Robot) ---
+    long leftSpace = (valFL + valBL) / 2;
+    long rightSpace = (valFR + valBR) / 2;
+
+    long difference = leftSpace - rightSpace;
+    int deadZone = 200; // 20cm deadzone for stability
+
+    // --- 5. Decide Steering ---
+    if (difference > deadZone) {
+        channelNavCommand = "NAV: STEER LEFT"; 
+    }
+    else if (difference < -deadZone) {
+        channelNavCommand = "NAV: STEER RIGHT";
+    }
+    else {
+        channelNavCommand = "NAV: STRAIGHT";
+    }
+}
+
+// =======================================================================================
+// =======================================================================================
+// 9. LOGIC: SAFETY FSM & AUTONOMOUS ACTION
+// =======================================================================================
+// =======================================================================================
+
+void checkAndSetAutonomousAction() { 
+    long frontDist = *sensors[0].lastDistance; 
+    long backDist = *sensors[1].lastDistance;  
+    long leftDist = *sensors[2].lastDistance;  
+    long rightDist = *sensors[3].lastDistance; 
+    
+    bool frontBlock = isCriticallyBlockedFront(frontDist);  
+    bool backBlock = isCriticallyBlockedBack(backDist);      
+    bool leftBlock = isCriticallyBlockedSide(leftDist);      
+    bool rightBlock = isCriticallyBlockedSide(rightDist);    
+    bool anyCriticalStopBlock = frontBlock || backBlock || leftBlock || rightBlock;
+    
+    switch (currentState) {
+        case STATE_IDLE: {
+            if (anyCriticalStopBlock) {
+                currentState = STATE_STOP_TIMER;
+                actionStartTime = millis();
+                stepDirection = "NONE";
+            } 
+            else {
+                // If not blocked, calculate centering logic for display/use
+                calculateChannelNavigation();
+            }
+            break;
+        }
+
+        case STATE_STOP_TIMER: {
+            if (millis() - actionStartTime >= STOP_DURATION_MS) {
+                
+                // Re-check sensors
+                frontBlock = isCriticallyBlockedFront(*sensors[0].lastDistance);
+                backBlock = isCriticallyBlockedBack(*sensors[1].lastDistance);
+                leftBlock = isCriticallyBlockedSide(*sensors[2].lastDistance);
+                rightBlock = isCriticallyBlockedSide(*sensors[3].lastDistance);
+                anyCriticalStopBlock = frontBlock || backBlock || leftBlock || rightBlock;
+
+                if (!anyCriticalStopBlock) {
+                    stepDirection = "NONE";
+                    currentState = STATE_IDLE;
+                }
+                else if (backBlock) {
+                    stepDirection = "MOVE FORWARD";  
+                    currentState = STATE_STEP_ACTION;
+                    actionStartTime = millis();  
+                } 
+                else if (frontBlock) {
+                    bool isLeftClear = (*sensors[2].lastDistance == 0 || *sensors[2].lastDistance > CRITICAL_STOP_MAX_MM);
+                    bool isRightClear = (*sensors[3].lastDistance == 0 || *sensors[3].lastDistance > CRITICAL_STOP_MAX_MM);
+                    
+                    if (isLeftClear) {
+                        stepDirection = "STEP LEFT";
+                    } else if (isRightClear) {
+                        stepDirection = "STEP RIGHT";
+                    } else {
+                        stepDirection = "BLOCKED"; 
+                    }
+                    
+                    currentState = STATE_STEP_ACTION;
+                    actionStartTime = millis();  
+                } 
+                else if (leftBlock) { 
+                    stepDirection = "STEP RIGHT";  
+                    currentState = STATE_STEP_ACTION;
+                    actionStartTime = millis();
+                } 
+                else if (rightBlock) { 
+                    stepDirection = "STEP LEFT";  
+                    currentState = STATE_STEP_ACTION;
+                    actionStartTime = millis();
+                } 
+            }
+            break;
+        }
+        
+        case STATE_STEP_ACTION: {
+            if (millis() - actionStartTime >= STEP_ACTION_DURATION_MS) {
+                currentState = STATE_IDLE;
+                stepDirection = "NONE";  
+            }
+            break;
+        }
+    }
+}
+
+// =======================================================================================
+// =======================================================================================
+// 10. BROADCASTING (LIDAR, ULTRA, STATUS)
+// =======================================================================================
+// =======================================================================================
+
+void readAndBroadcastLidar() { 
+  if (LidarSerialPort.available() >= 47) {
+    if (LidarSerialPort.read() == 0x54) {
+      if (LidarSerialPort.read() == 0x2C) {
+        
+        // Reset Diagonals
+        dist_FrontRight = 6000; 
+        dist_FrontLeft = 6000;  
+        dist_BackLeft = 6000;   
+        dist_BackRight = 6000;  
+
+        uint8_t buf[45];
+        LidarSerialPort.readBytes(buf, 45); 
+
+        uint16_t startAngle = buf[2] | (buf[3] << 8);
+        uint16_t endAngle = buf[40] | (buf[41] << 8);
+        
+        if (endAngle < startAngle) endAngle += 36000;
+        float step = (float)(endAngle - startAngle) / 11.0;
+
+        for (int i = 0; i < 12; i++) {
+            int base = 4 + (i * 3);
+            uint16_t rawDistance = buf[base] | (buf[base+1] << 8);
+            uint8_t confidence = buf[base+2];
+
+            float currentAngle = (startAngle + step * i) / 100.0;  
+            if (currentAngle >= 360.0) currentAngle -= 360.0;
+            
+            if (rawDistance > 0 && confidence > 100) {
+                
+                // Capture Diagonals
+                if (currentAngle > 30 && currentAngle < 60) {
+                    dist_FrontRight = min(dist_FrontRight, (long)rawDistance);
+                }
+                if (currentAngle > 120 && currentAngle < 150) {
+                    dist_FrontLeft = min(dist_FrontLeft, (long)rawDistance);
+                }
+                if (currentAngle > 210 && currentAngle < 240) {
+                    dist_BackLeft = min(dist_BackLeft, (long)rawDistance);
+                }
+                if (currentAngle > 300 && currentAngle < 330) {
+                    dist_BackRight = min(dist_BackRight, (long)rawDistance);
+                }
+                
+                // Note: Not sending JSON to save bandwidth, but reading data for FSM.
+            } 
+        }
+      } else {
+        while(LidarSerialPort.available() > 0) LidarSerialPort.read(); 
+      }
+    }
+  }
+}
+
+void broadcastUltraData() { 
+    if (millis() - lastUltraScanTime >= ultraScanInterval) {
+        UltrasonicSensor& current = sensors[currentUltraSensor];
+        long rawDist = measureUltrasonic(current.trigPin, current.echoPin);  
+        
+        *current.lastDistance = rawDist;
+        
+        // Note: Not sending JSON to save bandwidth, but reading data for FSM.
+        
+        currentUltraSensor = (currentUltraSensor + 1) % NUM_SENSORS;
+        lastUltraScanTime = millis();
+    }
+}
+
+void broadcastStatus() { 
+    if (millis() - lastStatusBroadcastTime >= STATUS_BROADCAST_INTERVAL) {
+        
+        StaticJsonDocument<256> doc;
+        doc["type"] = "STATUS";
+        doc["sats"] = satCount;
+        doc["cal"] = String(sysCal) + "/" + String(gyroCal) + "/" + String(magCal);
+
+        // Logic Merge: If FSM is active, show Safety Status. Else show GPS or Channel Status.
+        if (currentState == STATE_IDLE) {
+            doc["action"] = "FREE TO GO";
+            
+            // If we have satellites, show GPS. If indoor, show Channel
+            if (satCount > 3) {
+                 doc["nav"] = navMainStatus; // GPS String
+            } else {
+                 doc["nav"] = channelNavCommand; // Channel String
+            }
+            doc["target"] = channelNavCommand;
+
+        } else if (currentState == STATE_STOP_TIMER) {
+            doc["action"] = "STOPPED";
+            doc["nav"] = "OBSTACLE DETECTED";
+            doc["target"] = "WAITING...";
+        } else {
+            doc["action"] = "AVOIDING";
+            doc["nav"] = String(stepDirection);
+            doc["target"] = String(stepDirection);
+        }
+
+        // --- MODIFIED: Add FSM State to JSON for Webpage visual stop light ---
+        doc["fsmState"] = currentState;
+
+        char json[256];
+        serializeJson(doc, json);
+        webSocket.broadcastTXT(json);
+
+        lastStatusBroadcastTime = millis();
+    }
+}
+
+// MODIFIED: Simplified to only display the instruction string passed.
+void displayInstructionsOnOLED(String instruction) {
+    
+    // OLED: Ensure display is normal (not inverted)
+    display.invertDisplay(false); 
+    
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE); 
+    display.setCursor(0, 0);
+
+    // --- NEW: Directly display the received instruction string (e.g., "TURN LEFT") ---
+    String displayLine = instruction; 
+    
+    int maxChars = 21;
+    String line1 = "";
+    String line2 = "";
+    
+    // Use the instruction for multi-line logic
+    if (displayLine.length() > maxChars) {
+        int splitPoint = displayLine.lastIndexOf(' ', maxChars);
+        if (splitPoint == -1) splitPoint = maxChars;
+        line1 = displayLine.substring(0, splitPoint);
+        line2 = displayLine.substring(splitPoint); 
+        line2.trim(); 
+    } else {
+        line1 = displayLine;
+    }
+
+    int16_t x1, y1;
+    uint16_t w, h;
+    display.getTextBounds(line1, 0, 0, &x1, &y1, &w, &h);
+    display.setCursor((SCREEN_WIDTH - w) / 2, 8);
+    display.println(line1);
+
+    if (line2.length() > 0) {
+        display.getTextBounds(line2, 0, 0, &x1, &y1, &w, &h);
+        display.setCursor((SCREEN_WIDTH - w) / 2, 20); 
+        display.println(line2);
+    }
+    
+    display.display();
+}
+
+// =======================================================================================
+// =======================================================================================
+// 11. WEB SERVER HANDLERS
+// =======================================================================================
+// =======================================================================================
+
+void handleMapData() {
+    String json = "{";
+    json += "\"lat\":" + String(currentLat, 8) + ","; 
+    json += "\"lng\":" + String(currentLng, 8) + ",";
+    json += "\"head\":" + String(currentHeading, 2) + ",";
+    json += "\"sats\":" + String(satCount) + ",";
+    json += "\"status\":\"" + navMainStatus + "\",";
+    json += "\"fsmState\":" + String(currentState);
+    json += "}";
+    server.send(200, "application/json", json);
+}
+
+void handleSetTarget() {
+    // Check if we received a Compass Offset Adjustment from UI
+    if (server.hasArg("offset")) {
+        GLOBAL_COMPASS_OFFSET = server.arg("offset").toInt();
+        server.send(200, "text/plain", "OFFSET UPDATED");
+        return;
+    }
+
+    if (server.hasArg("lat") && server.hasArg("lng")) {
+        targetLat = server.arg("lat").toDouble();
+        targetLng = server.arg("lng").toDouble();
+        activeTargetID = 1; 
+        navMainStatus = "GPS: TARGET RECEIVED";
+    }
+    if (server.hasArg("stop")) {
+        activeTargetID = -1;
+        navMainStatus = "STOPPED BY USER";
+    }
+    server.send(200, "text/plain", "OK");
+}
+
+// --- NEW HANDLER: Receives the exact instruction string from the webpage ---
+void handleSetOLEDDirection() {
+    if (server.hasArg("dir")) {
+        // Decode the URL-encoded string and store it
+        webDirectionInstruction = server.arg("dir");
+    }
+    server.send(200, "text/plain", "OK");
+}
+// --------------------------------------------------------------------------
+
+void handleRoot() {
+  const char* html = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<title>ROBOT NAV V21 (PATHS FIXED)</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta charset="utf-8">
+<style>
+  body { 
+      font-family: 'Segoe UI', sans-serif; 
+      margin: 0; 
+      background-color: #121212; 
+      color: white; 
+      display: flex; 
+      height: 100vh; 
+      overflow: hidden; 
+  }
+  #map-panel { 
+      flex: 3; 
+      position: relative; 
+      border-right: 2px solid #333; 
+  }
+  canvas#mapCanvas { 
+      display: block; 
+      width: 100%; 
+      height: 100%; 
+      cursor: grab; 
+      background-color: #000; 
+  }
+  canvas#mapCanvas:active { cursor: grabbing; }
+
+  #nav-hud {
+    position: absolute; 
+    top: 20px; 
+    left: 50%; 
+    transform: translateX(-50%);
+    background: rgba(20, 20, 20, 0.95); 
+    border: 3px solid #00e676; 
+    border-radius: 15px;
+    padding: 20px; 
+    min-width: 320px; 
+    text-align: center; 
+    box-shadow: 0 8px 25px rgba(0,0,0,0.7); 
+    z-index: 200;
+    display: none;
+  }
+  #nav-icon {
+      font-size: 60px;
+      display: block;
+      margin-bottom: 5px;
+      line-height: 1;
+  }
+  #nav-instruction { 
+      font-size: 28px; 
+      font-weight: 800; 
+      color: #fff; 
+      display: block; 
+      text-transform: uppercase;
+      text-shadow: 0px 2px 5px rgba(0,0,0,0.8);
+      margin-bottom: 5px; 
+  }
+  #nav-subtext {
+      font-size: 18px; 
+      color: #ddd;
+      font-weight: 500;
+      margin-bottom: 10px;
+  }
+  #nav-distance { 
+      font-size: 40px; 
+      font-weight: 900; 
+      color: #00e676; 
+  }
+  #nav-total { 
+      font-size: 12px; 
+      color: #888; 
+      margin-top: 10px; 
+      border-top: 1px solid #444;
+      padding-top: 5px;
+  }
+  #gps-overlay { 
+      position: absolute; 
+      bottom: 20px; 
+      left: 20px; 
+      background: rgba(0,0,0,0.6); 
+      padding: 8px; 
+      border-radius: 5px; 
+      pointer-events: none; 
+      z-index: 100; 
+      font-family: monospace; 
+      font-size: 11px; 
+      color: #ccc; 
+  }
+  #dash-panel { 
+      flex: 1; 
+      background-color: #1e1e1e; 
+      padding: 10px; 
+      display: flex; 
+      flex-direction: column; 
+      overflow-y: auto; 
+      min-width: 320px;
+  }
+  .box { 
+      background: #2a2a2a; 
+      border-radius: 8px; 
+      padding: 15px; 
+      margin-bottom: 15px; 
+      border: 3px solid #2a2a2a; /* Base border */
+  }
+  h2 { 
+      margin: 0 0 10px 0; 
+      font-size: 16px; 
+      color: #007bff; 
+      border-bottom: 1px solid #444; 
+      padding-bottom: 5px; 
+  }
+  .status-line { 
+      display: flex; 
+      justify-content: space-between; 
+      margin-bottom: 5px; 
+      font-size: 14px; 
+  }
+  .val { font-weight: bold; color: #00e676; }
+  .val.warn { color: orange; }
+  .val.err { color: red; }
+  
+  /* --- CRITICAL STOP STYLES (Applies to Status Box & Nav HUD) --- */
+  .box.stop-active,
+  #nav-hud.stop-active {
+      border-color: #d32f2f; /* Red border */
+      box-shadow: 0 0 10px rgba(211, 47, 47, 0.8); /* Red glowing effect */
+  }
+  #nav-hud.stop-active #nav-distance {
+      color: #d32f2f; /* Keep distance red in stop mode */
+  }
+  /* ----------------------------------------------- */
+
+  /* LIDAR RADAR */
+  canvas#lidarCanvas { 
+      width: 100%; 
+      background: #fff; 
+      border: 2px solid #555; 
+      border-radius: 5px; 
+  }
+  
+  .btn { 
+      width: 100%; 
+      padding: 12px; 
+      margin-bottom: 8px; 
+      border: none; 
+      border-radius: 5px; 
+      cursor: pointer; 
+      font-weight: bold; 
+      color: white; 
+      background: #444; 
+  }
+  .btn-go { background: #007bff; }
+  .btn-stop { background: #d32f2f; }
+  select { 
+      width: 100%; 
+      padding: 12px; 
+      margin-bottom: 12px; 
+      background: #333; 
+      color: white; 
+      border: 1px solid #555; 
+      border-radius: 5px; 
+  }
+  input[type=range] { width: 100%; }
+</style>
+</head>
+<body>
+
+<div id="map-panel">
+    <div id="nav-hud">
+        <span id="nav-icon">&#8593;</span>
+        <span id="nav-instruction">--</span>
+        <div id="nav-subtext"></div>
+        <div id="nav-distance">--</div>
+        <div id="nav-total">TRIP: <span id="total-dist">0</span>m | <span id="turn-deg">0</span>&deg; Error</div>
+    </div>
+    <canvas id="mapCanvas"></canvas>
+    <div id="gps-overlay">
+        <div>GPS: <span id="disp-lat">--</span>, <span id="disp-lng">--</span></div>
+        <div>SATS: <span id="disp-sats">0</span> | HDG: <span id="disp-hdg">0</span>&deg;</div>
+        <div>CAL: <span id="disp-cal">0/0/0</span> (Sys/Gyro/Mag)</div>
+        <div style="color:orange; font-weight:bold;" id="building-warning"></div>
+    </div>
+</div>
+
+<div id="dash-panel">
+    <div class="box">
+        <h2>SYSTEM STATUS</h2>
+        <div class="status-line"><span>NAV:</span> <span id="sys-nav" class="val">--</span></div>
+        <div class="status-line"><span>FSM ACTION:</span> <span id="sys-action" class="val warn">--</span></div>
+    </div>
+
+    <div class="box">
+        <h2>LIDAR & ULTRASONIC RADAR</h2>
+        <canvas id="lidarCanvas" width="300" height="300"></canvas>
+        <div style="font-size:10px; color:#aaa; margin-top:5px; text-align:center;">RED=LiDAR | BLUE=Ultrasonic</div>
+    </div>
+    
+    <div class="box">
+        <h2>COMPASS CALIBRATION</h2>
+        <div style="font-size:11px; color:#aaa; margin-bottom:5px;">ADJUST IF ARROW IS WRONG</div>
+        <input type="range" min="0" max="360" value="180" id="offsetSlider" oninput="updateOffset(this.value)">
+        <div style="text-align:center; font-weight:bold;">OFFSET: <span id="offsetVal">180</span>&deg;</div>
+        <div style="margin-top:5px;">
+            <input type="checkbox" id="chkInvert"> <label for="chkInvert" style="font-size:12px;">Invert Turns (Left/Right Swap)</label>
+        </div>
+    </div>
+
+    <div class="box">
+        <h2>GPS NAVIGATION</h2>
+        <select id="targetSelect">
+            <option value="-1">-- SELECT DESTINATION --</option>
+            <option value="1">H BUILDING</option>
+            <option value="2">POST BUILDING</option>
+            <option value="3">LIBRARY</option>
+            <option value="4">FOUNTAIN</option>
+        </select>
+        <button class="btn btn-go" onclick="startNav()">START GPS NAV</button>
+        <button class="btn btn-stop" onclick="cancelNav()">CANCEL</button>
+    </div>
+</div>
+
+<script>
+// ==========================================
+// 1. DATA (MAP & WAYPOINTS) - FULLY UNCOMPRESSED
+// ==========================================
+const REF = { lat: 48.82987, lng: 12.95516 }; 
+const SCALE = 600000; 
+
+const TARGETS = [
+  {id:1, name: "H BUILDING", lat: 48.829474, lng: 12.954294},
+  {id:2, name: "POST BUILDING", lat: 48.830045, lng: 12.955010},
+  {id:3, name: "LIBRARY", lat: 48.829511, lng: 12.955618},
+  {id:6, name: "PASSAGE 1 ENTRY", lat: 48.829697, lng: 12.954893},
+  {id:7, name: "PASSAGE 1 MIDDLE", lat: 48.829621, lng: 12.954832},
+  {id:8, name: "PASSAGE 1 EXIT", lat: 48.829574, lng: 12.954794},
+  {id:10, name: "TREAT1", lat: 48.830003, lng: 12.955137},
+  {id:15, name: "TREAT3", lat: 48.829497, lng: 12.954745},
+  {id:16, name: "TREAT4", lat: 48.829493, lng: 12.954774},
+  {id:18, name: "TREAT6", lat: 48.829389, lng: 12.954681},
+  {id:19, name: "TREAT7", lat: 48.829379, lng: 12.954571}
+];
+
+const BUILDINGS = [
+  { 
+    "name": "Fountain Area", 
+    "type": "building", 
+    "pts": [ 
+        { "lat": 48.829903, "lng": 12.954989 },
+        { "lat": 48.829866, "lng": 12.954943 },  
+        { "lat": 48.829847, "lng": 12.954998 },  
+        { "lat": 48.829886, "lng": 12.955041 } 
+    ] 
+  },
+  { 
+    "name": "b Building", 
+    "type": "building", 
+    "pts": [ 
+        { "lat": 48.830350, "lng": 12.954620 }, 
+        { "lat": 48.830232, "lng": 12.954521 }, 
+        { "lat": 48.830025, "lng": 12.955102 }, 
+        { "lat": 48.830160, "lng": 12.955200 } 
+    ] 
+  },
+  { 
+    "name": "C Building", 
+    "type": "building", 
+    "pts": [ 
+        { "lat": 48.829994, "lng": 12.955192 }, 
+        { "lat": 48.830114, "lng": 12.955298 }, 
+        { "lat": 48.829671, "lng": 12.956561 }, 
+        { "lat": 48.829544, "lng": 12.956459 } 
+    ] 
+  },
+  { 
+    "name": "Library 1", 
+    "type": "building", 
+    "pts": [ 
+        { "lat": 48.82957, "lng": 12.9561 }, 
+        { "lat": 48.82968, "lng": 12.95579 }, 
+        { "lat": 48.8295, "lng": 12.95564 }, 
+        { "lat": 48.82939, "lng": 12.95595 } 
+    ] 
+  },
+  { 
+    "name": "Pool & Store", 
+    "type": "building", 
+    "pts": [ 
+        { "lat": 48.82973, "lng": 12.95567 }, 
+        { "lat": 48.82955, "lng": 12.95553 }, 
+        { "lat": 48.829708, "lng": 12.955096 }, 
+        { "lat": 48.829877, "lng": 12.955235 } 
+    ] 
+  },
+  { 
+    "name": "Pool Stage 1", 
+    "type": "building", 
+    "pts": [ 
+        { "lat": 48.83005, "lng": 12.95473 }, 
+        { "lat": 48.82988, "lng": 12.95459 }, 
+        { "lat": 48.82998, "lng": 12.95432 }, 
+        { "lat": 48.83015, "lng": 12.95446 } 
+    ] 
+  },
+  { 
+    "name": "d Building", 
+    "type": "building", 
+    "pts": [ 
+        { "lat": 48.829917, "lng": 12.954191 }, 
+        { "lat": 48.829816, "lng": 12.954101 }, 
+        { "lat": 48.829595, "lng": 12.954746 }, 
+        { "lat": 48.829691, "lng": 12.954825 } 
+    ] 
+  },
+  { 
+    "name": "e Building", 
+    "type": "building", 
+    "pts": [ 
+        { "lat": 48.829655, "lng": 12.954915 }, 
+        { "lat": 48.829561, "lng": 12.954837 }, 
+        { "lat": 48.829351, "lng": 12.955414 }, 
+        { "lat": 48.829451, "lng": 12.955484 } 
+    ] 
+  },
+  { 
+    "name": "e1 Building", 
+    "type": "building", 
+    "pts": [ 
+        { "lat": 48.82946, "lng": 12.95558 }, 
+        { "lat": 48.82927, "lng": 12.95543 }, 
+        { "lat": 48.82905, "lng": 12.95606 }, 
+        { "lat": 48.82923, "lng": 12.95621 } 
+    ] 
+  },
+  { 
+    "name": "h Building", 
+    "type": "building", 
+    "pts": [ 
+        { "lat": 48.82957, "lng": 12.95434 }, 
+        { "lat": 48.82937, "lng": 12.95418 }, 
+        { "lat": 48.82947, "lng": 12.95389 }, 
+        { "lat": 48.82967, "lng": 12.95406 } 
+    ] 
+  }
+];
+
+const BOUNDARY = [
+    { "lat": 48.830388, "lng": 12.954659 },
+    { "lat": 48.829706, "lng": 12.956585 },
+    { "lat": 48.828790, "lng": 12.955861 },
+    { "lat": 48.829523, "lng": 12.953900 }
+];
+
+const WAYPOINTS = [
+   {id:0, lat:48.82987, lng:12.95516}, 
+  {id:1, lat:48.82995, lng:12.95525},
+  {id:2, lat:48.82980, lng:12.95500},
+  {id:30, lat:48.82965, lng:12.95530}, 
+  {id:31, lat:48.82955, lng:12.95550},
+  {id:40, lat:48.82940, lng:12.95450}, 
+  {id:50, lat:48.82975, lng:12.95480},
+  {id:6, lat: 48.829697, lng: 12.954893},      
+  {id:7, lat: 48.829621, lng: 12.954832},      
+  {id:8, lat: 48.829574, lng: 12.954794},      
+  {id:10, lat: 48.830003, lng: 12.955137},         
+  {id:12, lat: 48.829828, lng: 12.955045},          
+  {id:15, lat: 48.829497, lng: 12.954745},     
+  {id:16, lat: 48.829493, lng: 12.954774},      
+  {id:18, lat: 48.829389, lng: 12.954681},     
+  {id:19, lat: 48.829379, lng: 12.954571}, 
+  {id:71, lat:48.82975, lng:12.95545}, 
+  {id:72, lat:48.82935, lng:12.95500}, 
+  {id:73, lat:48.83015, lng:12.95505}, 
+  {id:74, lat:48.83020, lng:12.95485}, 
+  {id:75, lat:48.82990, lng:12.95450}, 
+  {id:76, lat:48.82920, lng:12.95460}, 
+  {id:77, lat:48.82915, lng:12.95580}, 
+  {id:78, lat:48.82960, lng:12.95415}, 
+  {id:79, lat:48.82990, lng:12.95475}, 
+  {id:80, lat:48.82970, lng:12.95430}, 
+  {id:81, lat:48.82950, lng:12.95580}, 
+  {id:82, lat:48.82930, lng:12.95600}, 
+  {id:83, lat:48.82990, lng:12.95630}, 
+  {id:100, lat:48.82980, lng:12.95512}, 
+  {id:101, lat:48.82990, lng:12.95518},
+  {id:102, lat:48.82970, lng:12.95505}, 
+  {id:103, lat:48.82985, lng:12.95480},
+  {id:110, lat:48.83000, lng:12.95470}, 
+  {id:111, lat:48.83005, lng:12.95460}, 
+  {id:112, lat:48.83000, lng:12.95498}, 
+  {id:120, lat:48.82970, lng:12.95450}, 
+  {id:121, lat:48.82955, lng:12.95420}, 
+  {id:130, lat:48.82970, lng:12.95540}, 
+  {id:131, lat:48.82960, lng:12.95560},
+  {id:140, lat:48.82935, lng:12.95440}, 
+  {id:150, lat:48.82980, lng:12.95470},
+  {id:170, lat:48.82980, lng:12.95530}, 
+  {id:171, lat:48.82970, lng:12.95540}, 
+  {id:172, lat:48.82930, lng:12.95505}, 
+  {id:173, lat:48.83020, lng:12.95510}, 
+  {id:174, lat:48.83025, lng:12.95480}, 
+  {id:175, lat:48.82995, lng:12.95455}, 
+  {id:176, lat:48.82925, lng:12.95465}, 
+  {id:177, lat:48.82920, lng:12.95585}, 
+  {id:178, lat:48.82965, lng:12.95420}, 
+  {id:179, lat:48.82995, lng:12.95480}, 
+  {id:180, lat:48.82975, lng:12.95435}, 
+  {id:181, lat:48.82955, lng:12.95585}, 
+  {id:182, lat:48.82935, lng:12.95605}, 
+  {id:183, lat:48.82995, lng:12.95635}
+];
+
+// ==========================================
+// 2. MAP LOGIC
+// ==========================================
+const mapCvs = document.getElementById('mapCanvas');
+const mCtx = mapCvs.getContext('2d');
+let curLat=0, curLng=0, curHead=0;
+let plannedPath = [];
+let targetIndex = 1;
+let zoom=1.5; let camX=0, camY=0; let dragging=false; let lastX, lastY;
+
+function toXY(lat, lng) {
+    let x = -((lng - REF.lng) * Math.cos(REF.lat * Math.PI/180) * SCALE);
+    let y = (lat - REF.lat) * SCALE; 
+    return {x, y};
+}
+
+// ** MAP MATCHING (RESTORED FOR WARNINGS) **
+function isPointInPolygon(p, polygon) {
+    let inside = false;
+    for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+        let xi = polygon[i].lat, yi = polygon[i].lng;
+        let xj = polygon[j].lat, yj = polygon[j].lng;
+        
+        let intersect = ((yi > p.lng) != (yj > p.lng)) &&
+            (p.lat < (xj - xi) * (p.lng - yi) / (yj - yi) + xi);
+        if (intersect) inside = !inside;
+    }
+    return inside;
+}
+
+function getDist(p1, p2) {
+    const R=6371e3; const f1=p1.lat*Math.PI/180; const f2=p2.lat*Math.PI/180;
+    const df=(p2.lat-p1.lat)*Math.PI/180; const dl=(p2.lng-p1.lng)*Math.PI/180;
+    const a=Math.sin(df/2)*Math.sin(df/2) + Math.cos(f1)*Math.cos(f2)*Math.sin(dl/2)*Math.sin(dl/2);
+    return R*2*Math.atan2(Math.sqrt(a),Math.sqrt(1-a));
+}
+function getBearing(p1, p2) {
+    const y = Math.sin(p2.lng*Math.PI/180 - p1.lng*Math.PI/180) * Math.cos(p2.lat*Math.PI/180);
+    const x = Math.cos(p1.lat*Math.PI/180)*Math.sin(p2.lat*Math.PI/180) -
+              Math.sin(p1.lat*Math.PI/180)*Math.cos(p2.lat*Math.PI/180)*Math.cos(p2.lng*Math.PI/180 - p1.lng*Math.PI/180);
+    const brng = Math.atan2(y, x) * 180 / Math.PI;
+    return (brng + 360) % 360;
+}
+function intersect(p1,p2,p3,p4) {
+    // FIX: ADDED MULTIPLICATION OPERATOR (*)
+    const ccw = (a,b,c) => (c.y-a.y)*(b.x-a.x) > (b.y-a.y)*(c.x-a.x); 
+    const a = toXY(p1.lat,p1.lng), b = toXY(p2.lat,p2.lng);
+    const c = toXY(p3.lat,p3.lng), d = toXY(p4.lat,p4.lng);
+    return (ccw(a,c,d) != ccw(b,c,d)) && (ccw(a,b,c) != ccw(a,b,d));
+}
+
+function isPathClear(n1, n2) {
+    for(let b of BUILDINGS) {
+        for(let i=0; i<b.pts.length; i++) {
+            if(intersect(n1, n2, b.pts[i], b.pts[(i+1)%b.pts.length])) return false;
+        }
+    }
+    return true;
+}
+
+// ** MAP GEOMETRY LOGIC **
+// Uses the map path to determine the turn, NOT the robot's heading
+function getTurnInstruction(prevWp, currWp, nextWp) {
+    if (!prevWp || !currWp || !nextWp) return {text: "STRAIGHT", icon: "&#8593;"};
+
+    let angleIn = getBearing(prevWp, currWp);
+    let angleOut = getBearing(currWp, nextWp);
+    let turnAngle = angleOut - angleIn;
+    
+    // Normalize angle to -180 to 180
+    if(turnAngle > 180) turnAngle -= 360;
+    if(turnAngle < -180) turnAngle += 360;
+
+    let invert = document.getElementById('chkInvert').checked;
+    let labelRight = invert ? "LEFT" : "RIGHT";
+    let labelLeft = invert ? "RIGHT" : "LEFT";
+    let iconRight = invert ? "&#8592;" : "&#8594;"; 
+    let iconLeft = invert ? "&#8594;" : "&#8592;";
+
+    if (Math.abs(turnAngle) < 25) {
+        return {text: "CONTINUE STRAIGHT", icon: "&#8593;"};
+    } else if (turnAngle > 45) {
+        return {text: "TURN " + labelRight, icon: iconRight};
+    } else if (turnAngle > 10) {
+        return {text: "SLIGHT " + labelRight, icon: "&#8599;"};
+    } else if (turnAngle < -45) {
+        return {text: "TURN " + labelLeft, icon: iconLeft};
+    } else if (turnAngle < -10) {
+        return {text: "SLIGHT " + labelLeft, icon: "&#8598;"};
+    }
+    return {text: "STRAIGHT", icon: "&#8593;"};
+}
+
+// MODIFIED PATHFINDER FOR SPECIFIC H/POST LOGIC
+function calcPath(start, end) {
+    let startNode = {id:'S',lat:start.lat,lng:start.lng};
+    let endNode = {id:'E',lat:end.lat,lng:end.lng};
+
+    // The sequence of waypoints between POST (ID 2) and H (ID 1)
+    // TREAT 1, PASSAGE ENTRY, PASSAGE MIDDLE, PASSAGE EXIT, TREAT 3, TREAT 4, TREAT 6
+    // Removed TREAT 2 (11) and TREAT 5 (17)
+    const corePathIds = [10, 6, 7, 8, 15, 16, 18, 19];
+
+
+    let targetPath = [];
+
+    // Case 1: Going to H BUILDING (ID 1)
+    if (end.id === 1) {
+        // Path: [Core Path] -> H
+        targetPath = corePathIds.map(id => WAYPOINTS.find(n => n.id === id)).filter(n => n);
+        targetPath.push(endNode); // Add H Building at the end
+    }
+    // Case 2: Going to POST BUILDING (ID 2)
+    else if (end.id === 2) {
+        // Path: [Reverse Core Path] -> Post
+        let revIds = [...corePathIds].reverse();
+        targetPath = revIds.map(id => WAYPOINTS.find(n => n.id === id)).filter(n => n);
+        targetPath.push(endNode); // Add Post Building at the end
+    }
+    
+    // If a special path was defined, find the closest start point
+    if (targetPath.length > 0) {
+        let closestWPIndex = -1;
+        let minStartDistance = Infinity;
+        
+        // Find closest point in the sequence to snap to
+        for(let i = 0; i < targetPath.length; i++) {
+            let dist = getDist(startNode, targetPath[i]);
+            if (dist < minStartDistance) {
+                minStartDistance = dist;
+                closestWPIndex = i;
+            }
+        }
+
+        if (closestWPIndex !== -1) {
+            let finalPath = [startNode];
+            
+            // --- MODIFIED LOGIC: START FROM CLOSEST WAYPOINT ---
+            // This replaces the aggressive back-step (closestWPIndex - 2)
+            let startIndex = closestWPIndex; // Start from the closest waypoint in the sequence
+            
+            for(let i = startIndex; i < targetPath.length; i++) {
+                finalPath.push(targetPath[i]);
+            }
+            return finalPath;
+        }
+    }
+
+    // Default Fallback for other targets
+    return [startNode, endNode];
+}
+
+// DRAWING
+function drawMap() {
+    mapCvs.width = document.getElementById('map-panel').clientWidth;
+    mapCvs.height = document.getElementById('map-panel').clientHeight;
+    mCtx.clearRect(0, 0, mapCvs.width, mapCvs.height);
+    const cx = mapCvs.width/2, cy = mapCvs.height/2;
+    mCtx.save();
+    mCtx.translate(cx + camX, cy + camY);
+    mCtx.scale(zoom, zoom);
+    mCtx.rotate(315 * Math.PI/180); 
+    const cXY = toXY(REF.lat, REF.lng);
+    mCtx.translate(-cXY.x, -cXY.y);
+    mCtx.beginPath(); BOUNDARY.forEach((p,i)=>{let xy=toXY(p.lat,p.lng); (i==0)?mCtx.moveTo(xy.x,xy.y):mCtx.lineTo(xy.x,xy.y);});
+    mCtx.closePath(); mCtx.strokeStyle="#444"; mCtx.setLineDash([5,5]); mCtx.stroke(); mCtx.setLineDash([]);
+    BUILDINGS.forEach(b => {
+        mCtx.beginPath();
+        b.pts.forEach((p,i) => { let xy=toXY(p.lat,p.lng); (i==0)?mCtx.moveTo(xy.x,xy.y):mCtx.lineTo(xy.x,xy.y); });
+        mCtx.closePath(); mCtx.fillStyle="#333"; mCtx.fill(); mCtx.strokeStyle="#00e676"; mCtx.lineWidth=2; mCtx.stroke();
+        let tx=0, ty=0; b.pts.forEach(p=>{let t=toXY(p.lat,p.lng); tx+=t.x; ty+=t.y;});
+        mCtx.fillStyle="#888"; mCtx.fillText(b.name, tx/b.pts.length, ty/b.pts.length);
+    });
+    TARGETS.forEach(t => {
+        let xy = toXY(t.lat, t.lng);
+        mCtx.fillStyle="magenta"; mCtx.beginPath(); mCtx.arc(xy.x, xy.y, 6, 0, 6.28); mCtx.fill();
+        mCtx.fillStyle="white"; mCtx.fillText(t.name, xy.x+8, xy.y);
+    });
+    // --- PATH DRAWING SECTION (ENSURE CORRECT) ---
+    if(plannedPath.length > 1) {
+        mCtx.strokeStyle = "cyan"; mCtx.lineWidth = 4; mCtx.beginPath();
+        plannedPath.forEach((p,i) => { let xy=toXY(p.lat,p.lng); (i==0)?mCtx.moveTo(xy.x,xy.y):mCtx.lineTo(xy.x,xy.y); });
+        mCtx.stroke();
+    }
+    // ----------------------------------------------
+    if(curLat != 0) {
+        let rXY = toXY(curLat, curLng);
+        mCtx.save(); mCtx.translate(rXY.x, rXY.y); mCtx.rotate((curHead+45)*Math.PI/180);
+        mCtx.fillStyle="#00e676"; mCtx.beginPath(); mCtx.moveTo(0,-15); mCtx.lineTo(10,10); mCtx.lineTo(0,5); mCtx.lineTo(-10,10); mCtx.fill();
+        mCtx.restore();
+    }
+    mCtx.restore();
+}
+mapCvs.addEventListener('mousedown', e=>{dragging=true; lastX=e.clientX; lastY=e.clientY;});
+mapCvs.addEventListener('mousemove', e=>{if(dragging){camX+=e.clientX-lastX; camY+=e.clientY-lastY; lastX=e.clientX; lastY=e.clientY;}});
+mapCvs.addEventListener('mouseup', ()=>dragging=false);
+mapCvs.addEventListener('wheel', e=>{e.preventDefault(); zoom+=e.deltaY*-0.001; zoom=Math.max(0.2, zoom);});
+
+// ==========================================
+// 3. WEBSOCKET LOGIC (STATUS ONLY)
+// ==========================================
+const ws = new WebSocket('ws://' + window.location.hostname + ':81/');
+const lCvs = document.getElementById('lidarCanvas');
+const lCtx = lCvs.getContext('2d');
+let lidarPoints = [];
+let ultraPoints = {};
+
+// --- PERSISTENCE VARIABLES FOR TURN DELAY (ADDED) ---
+let lastTurnInstruction = {text: "STRAIGHT", icon: "&#8593;"};
+let clearTurnTime = 0;
+// ----------------------------------------------------
+
+ws.onmessage = (e) => {
+    const d = JSON.parse(e.data);
+    if(d.type === "STATUS") {
+        document.getElementById('sys-nav').innerText = d.nav;
+        document.getElementById('sys-action').innerText = d.action + " (" + d.target + ")";
+    } else if(d.type === "LIDAR") {
+        lidarPoints.push(d); if(lidarPoints.length > 250) lidarPoints.shift();
+    } else if(d.type === "ULTRA") {
+        ultraPoints[d.id] = d; setTimeout(() => delete ultraPoints[d.id], 500); 
+    }
+};
+
+function drawLidar() {
+    lCtx.fillStyle = "white"; lCtx.fillRect(0,0,300,300);
+    const cx=150, cy=150, scale=150/5000; 
+    lCtx.strokeStyle = "#ddd";
+    lCtx.beginPath(); lCtx.moveTo(cx,0); lCtx.lineTo(cx,300); lCtx.stroke();
+    lCtx.beginPath(); lCtx.moveTo(0,cy); lCtx.lineTo(300,cy); lCtx.stroke();
+    lCtx.strokeStyle = "#ccc"; 
+    [1000,2000,3000,4000].forEach(r=>{ lCtx.beginPath(); lCtx.arc(cx, cy, r*scale, 0, 6.28); lCtx.stroke(); });
+    lCtx.fillStyle = "black"; lCtx.beginPath(); lCtx.arc(cx, cy, 5, 0, 6.28); lCtx.fill();
+    lCtx.fillStyle = "red";
+    lidarPoints.forEach(p => {
+        let rad = (p.angle - 90) * Math.PI / 180; 
+        let x = cx + Math.cos(rad) * p.distance * scale;
+        let y = cy + Math.sin(rad) * p.distance * scale;
+        lCtx.beginPath(); lCtx.arc(x, y, 2, 0, 6.28); lCtx.fill();
+    });
+    lCtx.strokeStyle = "blue"; lCtx.lineWidth = 2;
+    for(let k in ultraPoints) {
+        let p = ultraPoints[k];
+        let rad = (p.angle - 90) * Math.PI / 180;
+        let x = cx + Math.cos(rad) * p.distance * scale;
+        let y = cy + Math.sin(rad) * p.distance * scale;
+        lCtx.beginPath(); lCtx.moveTo(cx, cy); lCtx.lineTo(x, y); lCtx.stroke();
+        lCtx.fillStyle = "blue"; 
+        lCtx.fillText(k, x + 5, y);
+    }
+    requestAnimationFrame(drawLidar);
+}
+drawLidar();
+
+// ==========================================
+// 4. MAIN LOOP & CONTROLS
+// ==========================================
+setInterval(() => {
+    // FIX: ADDED QUOTES TO URL
+    fetch('/data').then(r => r.json()).then(d => {
+        let rawLat = d.lat; let rawLng = d.lng; curHead = d.head;
+        
+        // --- FSM State Check for Stop Light (Webpage Red Border) ---
+        const statusBox = document.querySelector('#dash-panel .box');
+        const navHud = document.getElementById('nav-hud'); // <-- Added for Nav HUD
+        // STATE_STOP_TIMER (1) or STATE_STEP_ACTION (2) are critical. STATE_IDLE is 0.
+        if (d.fsmState !== 0) {
+            statusBox.classList.add('stop-active');
+            navHud.classList.add('stop-active'); // <-- Added for Nav HUD
+        } else {
+            statusBox.classList.remove('stop-active');
+            navHud.classList.remove('stop-active'); // <-- Added for Nav HUD
+        }
+        // -----------------------------------------------------------------
+
+        if(isPointInPolygon({lat:rawLat, lng:rawLng}, BUILDINGS[0].pts)) {
+            document.getElementById('building-warning').innerText = "⚠ GPS DRIFT: INSIDE " + BUILDINGS[0].name;
+        } else {
+            document.getElementById('building-warning').innerText = "";
+        }
+
+        curLat = rawLat; curLng = rawLng; 
+        document.getElementById('disp-lat').innerText = curLat.toFixed(6);
+        document.getElementById('disp-lng').innerText = curLng.toFixed(6);
+        document.getElementById('disp-hdg').innerText = d.head.toFixed(0);
+        
+        if(plannedPath.length > 1 && targetIndex < plannedPath.length) {
+            let robot = {lat: curLat, lng: curLng};
+            let nextWp = plannedPath[targetIndex];
+            let dist = getDist(robot, nextWp);
+            
+            document.getElementById('nav-hud').style.display = 'block';
+            document.getElementById('nav-distance').innerText = dist.toFixed(0) + "m";
+            
+            
+            // --- NEW LOGIC: CALCULATE TURN BASED ON MAP GEOMETRY ---
+            let nextAction = {text: "STRAIGHT", icon: "&#8593;"};
+            
+            if (targetIndex < plannedPath.length - 1) {
+                let prevWp = plannedPath[targetIndex - 1]; 
+                let currWp = plannedPath[targetIndex];     
+                let nextNextWp = plannedPath[targetIndex + 1]; 
+                
+                if (!prevWp) prevWp = robot; 
+                
+                nextAction = getTurnInstruction(prevWp, currWp, nextNextWp);
+            } else {
+                nextAction = {text: "ARRIVING", icon: "&#127937;"};
+            }
+
+            // --- START TURN PERSISTENCE LOGIC ---
+            let currentDisplayAction = nextAction;
+            const TURN_DISPLAY_PERSISTENCE_MS = 3000; 
+
+            // 1. If a new TURN instruction is detected close to the waypoint (and include "SLIGHT")
+            if (dist < 15.0 && (nextAction.text.includes("TURN") || nextAction.text.includes("SLIGHT") || nextAction.text.includes("ARRIVING"))) {
+                // Save the turn instruction and set a clear time
+                lastTurnInstruction = nextAction;
+                clearTurnTime = Date.now() + TURN_DISPLAY_PERSISTENCE_MS;
+            }
+
+            // 2. If the persistent instruction is active, use it for display
+            if (clearTurnTime > Date.now() && !nextAction.text.includes("ARRIVING")) {
+                currentDisplayAction = lastTurnInstruction;
+            }
+            
+            // --- DISPLAY LOGIC (HUD) ---
+            let instr = document.getElementById('nav-instruction');
+            let icon = document.getElementById('nav-icon');
+            let sub = document.getElementById('nav-subtext');
+
+            if (dist > 15.0) {
+                 instr.innerText = "CONTINUE STRAIGHT";
+                 instr.style.color = "#00e676";
+                 icon.innerHTML = "&#8593;";
+                 
+                 // Only show 'Then TURN' if the persistent turn has already cleared
+                 if(nextAction.text !== "ARRIVING" && nextAction.text !== "STRAIGHT" && clearTurnTime <= Date.now()) {
+                     sub.innerText = "Then " + nextAction.text;
+                 } else {
+                     sub.innerText = "";
+                 }
+            } else {
+                // Use the determined instruction (persistent or current)
+                instr.innerText = currentDisplayAction.text;
+                icon.innerHTML = currentDisplayAction.icon;
+                instr.style.color = "cyan";
+                sub.innerText = "";
+            }
+            // --- END TURN PERSISTENCE LOGIC ---
+            
+            // --- NEW: Send the exact displayed instruction back to ESP32 for OLED ---
+            // Encode the string to handle spaces and special characters in the URL
+            if (currentDisplayAction.text) {
+                 fetch(`/set_oled_dir?dir=${encodeURIComponent(currentDisplayAction.text)}`);
+            }
+            // -----------------------------------------------------------------------
+
+            let total = 0;
+            for(let i=targetIndex-1; i<plannedPath.length-1; i++) {
+                 if(i<0) continue;
+                 total += getDist(plannedPath[i], plannedPath[i+1]);
+            }
+            document.getElementById('total-dist').innerText = total.toFixed(0);
+
+            if(dist < 3.0) {
+                 targetIndex++;
+                 if(targetIndex < plannedPath.length) {
+                     let newT = plannedPath[targetIndex];
+                     // FIX: ADDED QUOTES TO URL
+                     fetch(`/set_target?lat=${newT.lat}&lng=${newT.lng}`);
+                 } else {
+                     // FIX: ADDED QUOTES TO URL
+                     fetch('/set_target?stop=1'); plannedPath = [];
+                     document.getElementById('nav-instruction').innerText = "ARRIVED";
+                     document.getElementById('nav-icon').innerHTML = "&#127937;";
+                     setTimeout(() => { document.getElementById('nav-hud').style.display = 'none'; }, 5000);
+                 }
+            } else {
+                // FIX: ADDED QUOTES TO URL
+                fetch(`/set_target?lat=${nextWp.lat}&lng=${nextWp.lng}`);
+            }
+        }
+        drawMap();
+    });
+}, 500); 
+
+function updateOffset(val) {
+    document.getElementById('offsetVal').innerText = val;
+    // FIX: ADDED QUOTES TO URL
+    fetch(`/set_target?offset=${val}`);
+}
+
+function startNav() {
+    let id = document.getElementById('targetSelect').value;
+    if(id == -1) return;
+    let t = TARGETS.find(x => x.id == id);
+    let start = (curLat==0)?REF:{lat:curLat, lng:curLng};
+    
+    // Pass the actual target object so calcPath can check the ID
+    plannedPath = calcPath(start, t);
+    
+    if(plannedPath.length > 1) {
+        targetIndex = 1; 
+        let next = plannedPath[1];
+        // FIX: ADDED QUOTES TO URL
+        fetch(`/set_target?lat=${next.lat}&lng=${next.lng}`);
+    } else {
+        alert("Path blocked or invalid");
+    }
+}
+// FIX: ADDED QUOTES TO URL
+function cancelNav() { fetch('/set_target?stop=1'); plannedPath=[]; document.getElementById('nav-hud').style.display = 'none'; }
+</script>
+</body>
+</html>
+)rawliteral";
+  server.send(200, "text/html", html);
+}
+
+// =======================================================================================
+// =======================================================================================
+// 12. MAIN SETUP & LOOP
+// =======================================================================================
+// =======================================================================================
+void setup() {
+  Serial.begin(115200);
+  
+  // Hardware Init
+  gpsSerial.begin(GPSBaud, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+  LidarSerialPort.begin(LIDAR_BAUDRATE, SERIAL_8N1, LIDAR_RX_PIN, LIDAR_TX_PIN);
+  
+  Wire.begin();
+  if(!bno.begin()) {
+      Serial.println("IMU FAIL"); 
+  } else {
+      bno.setExtCrystalUse(true);
+  }
+
+  // --- OLED INIT ---
+  if(!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
+    Serial.println(F("SSD1306 allocation failed"));
+    for(;;); 
+  }
+  display.display();
+  delay(100);
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0,0);
+  display.println(F("ROBOT BOOTING..."));
+  display.display();
+
+  // Pin Modes
+  pinMode(TRIG_FRONT, OUTPUT); pinMode(ECHO_FRONT, INPUT); digitalWrite(TRIG_FRONT, LOW);
+  pinMode(TRIG_BACK, OUTPUT); pinMode(ECHO_BACK, INPUT); digitalWrite(TRIG_BACK, LOW);
+  pinMode(TRIG_LEFT, OUTPUT); pinMode(ECHO_LEFT, INPUT); digitalWrite(TRIG_LEFT, LOW);
+  pinMode(TRIG_RIGHT, OUTPUT); pinMode(ECHO_RIGHT, INPUT); digitalWrite(TRIG_RIGHT, LOW);
+
+  // WiFi
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  
+  // ** PERFORMANCE FIX: Disable Power Saving to prevent Lag **
+  WiFi.setSleep(false);
+  
+  while (WiFi.status() != WL_CONNECTED) { 
+      delay(500); 
+      Serial.print("."); 
+  }
+  Serial.println(WiFi.localIP());
+  
+  // Servers
+  server.on("/", handleRoot);
+  server.on("/data", handleMapData);
+  server.on("/set_target", handleSetTarget);
+  // --- NEW SERVER HANDLER (Setup) ---
+  server.on("/set_oled_dir", handleSetOLEDDirection);
+  // ----------------------------------
+  server.begin();
+  webSocket.begin();
+}
+
+void loop() {
+  server.handleClient();
+  webSocket.loop();
+  
+  // 1. SENSOR UPDATE (GPS)
+  while (gpsSerial.available() > 0) {
+    if (gps.encode(gpsSerial.read())) {
+      satCount = gps.satellites.value();
+      if (gps.location.isValid()) {
+          updateFilteredGPS(gps.location.lat(), gps.location.lng());
+      }
+    }
+  }
+  
+  // 2. SENSOR UPDATE (IMU)
+  bno.getCalibration(&sysCal, &gyroCal, &accelCal, &magCal);
+  sensors_event_t event; 
+  bno.getEvent(&event);
+  float rawHeading = event.orientation.x + GLOBAL_COMPASS_OFFSET;
+  if(rawHeading >= 360) rawHeading -= 360;
+  updateSmoothedHeading(rawHeading);
+  
+  // 3. SENSOR UPDATE (LIDAR/ULTRA & BROADCAST)
+  readAndBroadcastLidar();
+  broadcastUltraData();
+  
+  // 4. HYBRID NAVIGATION LOGIC
+  String navMainStatus = "BOOTING..."; 
+  String oledInstruction = "WAITING..."; 
+
+  
+  // --- A. SAFETY OVERRIDE (FSM) ---
+  checkAndSetAutonomousAction();
+
+  if (currentState != STATE_IDLE) {
+      // --- FSM ACTIVE (AVOIDANCE) ---
+      navMainStatus = "SAFETY: " + String(stepDirection);
+      oledInstruction = "SAFETY: " + String(stepDirection); 
+  } else {
+      // --- FSM IDLE (SAFE) ---
+      
+      // Determine if we should use GPS (Outdoor) or Channel (Indoor)
+      bool indoorMode = (satCount <= 3);
+
+      if (!indoorMode && activeTargetID != -1) {
+           // GPS Active: USE THE INSTRUCTION SENT FROM THE WEBPAGE UI
+           oledInstruction = webDirectionInstruction; // <-- Instruction from the webpage
+           
+           // Keep the navMainStatus updated for the WS broadcast
+           distToTarget = TinyGPSPlus::distanceBetween(currentLat, currentLng, targetLat, targetLng);
+           double bearing = TinyGPSPlus::courseTo(currentLat, currentLng, targetLat, targetLng);
+           float error = bearing - currentHeading;
+           if (error > 180) error -= 360; 
+           if (error < -180) error += 360;
+           char buf[32];
+           snprintf(buf, 32, "GPS: %.0f deg (%.0fm)", error, distToTarget);
+           navMainStatus = String(buf);
+           
+      } else {
+           // CHANNEL LOGIC (Fallback or default when no GPS target)
+           navMainStatus = channelNavCommand; 
+           oledInstruction = channelNavCommand; // Full channel command, e.g. "NAV: STEER LEFT"
+      }
+  }
+  
+  // 5. OLEd & BROADCAST STATUS
+  // The 'oledInstruction' now holds the webpage's exact text or the FSM/Channel instruction
+  displayInstructionsOnOLED(oledInstruction);
+  broadcastStatus();
+  
+  // Increased delay slightly to allow WiFi stack processing
+  delay(5);
+}

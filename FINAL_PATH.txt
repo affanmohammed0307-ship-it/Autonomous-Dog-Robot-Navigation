@@ -1,0 +1,938 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Wire.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BNO055.h>
+#include <utility/imumaths.h>
+#include <TinyGPSPlus.h> 
+#include <HardwareSerial.h>
+
+// ==========================================
+// 1. CONFIGURATION
+// ==========================================
+const char* ssid     = "ESP32_CAM_AP";      // <--- CHANGE THIS
+const char* password = "12345678";  // <--- CHANGE THIS
+
+// ==========================================
+// 2. HARDWARE SETUP
+// ==========================================
+// GPS connections
+static const int GPS_RX_PIN = 16;
+static const int GPS_TX_PIN = 17;
+static const uint32_t GPSBaud = 9600;
+
+// Objects
+TinyGPSPlus gps; 
+HardwareSerial gpsSerial(2);
+Adafruit_BNO055 bno = Adafruit_BNO055(55, 0x28);
+WebServer server(80);
+
+// ==========================================
+// 3. GLOBAL VARIABLES (FILTERED DATA)
+// ==========================================
+double currentLat = 0.0;
+double currentLng = 0.0;
+float currentHeading = 0.0;
+
+// Navigation State
+String navStatus = "WAITING FOR GPS...";
+int activeTargetID = -1;
+int satCount = 0; // Number of satellites
+
+// --- DEAD RECKONING STATE (IMPROVED) ---
+double drLat = 0.0; 
+double drLng = 0.0; 
+double velX = 0.0;  
+double velY = 0.0;  
+unsigned long lastDRTime = 0; 
+// ------------------------------------
+
+// ==========================================
+// 4. MAP WEBPAGE (FULL & UNCOMPRESSED) - MAP ALIGNMENT CORRECTED
+// ==========================================
+void handleMapPage() {
+  const char* mapHtml = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<title>TOGGLE NAVIGATION ENGINE</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<style>
+  body { 
+    margin: 0; 
+    background: #121212; 
+    color: white; 
+    font-family: 'Segoe UI', sans-serif; 
+    overflow: hidden; 
+  }
+
+  /* FULL SCREEN MAP CANVAS */
+  canvas { 
+    display: block; 
+    width: 100vw; 
+    height: 100vh; 
+    background: #181818; 
+    cursor: grab; 
+  }
+  canvas:active { cursor: grabbing; }
+
+  /* NAVIGATION CARD (Repositioned to Top-Right) */
+  #navCard {
+    position: absolute; 
+    top: 20px; 
+    right: 20px; 
+    width: 90%; 
+    max-width: 400px;
+    background: rgba(20, 20, 20, 0.95);
+    border: 2px solid #00e676;
+    border-radius: 12px;
+    padding: 15px;
+    text-align: center;
+    box-shadow: 0 0 25px rgba(0, 230, 118, 0.15);
+    z-index: 100;
+    transform: none; 
+    user-select: none;
+  }
+
+  .card-header {
+    cursor: move;
+    padding-bottom: 8px;
+    margin-bottom: 12px;
+    border-bottom: 1px solid #444;
+  }
+
+  .nav-title {
+    color: #eee;
+    font-size: 14px;
+    font-weight: 800;
+    letter-spacing: 1.5px;
+    text-transform: uppercase;
+  }
+
+  /* DROPDOWN */
+  select {
+    width: 100%;
+    padding: 12px;
+    background: #333;
+    color: white;
+    border: 1px solid #555;
+    border-radius: 6px;
+    font-size: 16px;
+    margin-bottom: 15px;
+    outline: none;
+  }
+
+  /* BUTTONS */
+  .btn-row { display: flex; gap: 10px; margin-bottom: 15px; }
+  
+  button {
+    flex: 1;
+    padding: 12px;
+    border: none;
+    border-radius: 6px;
+    font-size: 16px;
+    font-weight: bold;
+    cursor: pointer;
+    text-transform: uppercase;
+    transition: transform 0.1s;
+  }
+  
+  button:active { transform: scale(0.98); }
+  .btn-start { background: #00e676; color: #000; }
+  .btn-stop { background: #d32f2f; color: #fff; }
+
+  /* STATUS AREA */
+  .status-box {
+    background: #000;
+    border: 1px solid #333;
+    border-radius: 6px;
+    padding: 10px;
+    border-left: 4px solid #ffeb3b;
+    text-align: left;
+  }
+  
+  .status-row { display: flex; justify-content: space-between; align-items: center; }
+  .status-text { color: #ffeb3b; font-weight: bold; font-size: 16px; text-transform: uppercase; }
+  .meta-text { color: #888; font-size: 11px; margin-top: 4px; font-family: monospace; }
+  .gps-stats { color: #00e676; font-size: 11px; }
+
+  /* ZOOM BUTTONS (Moved to Top-Left) */
+  .zoom-controls {
+    position: absolute; top: 20px; left: 20px; z-index: 100; display: flex; flex-direction: column; gap: 8px;
+  }
+  .zoom-btn {
+    width: 45px; height: 45px; background: #222; color: #fff; font-size: 24px; font-weight: bold;
+    border: 1px solid #444; border-radius: 8px; cursor: pointer; display: flex; align-items: center; justify-content: center;
+    box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+  }
+  .zoom-btn:active { background: #444; }
+  
+</style>
+</head>
+<body>
+
+<!-- ZOOM UI -->
+<div class="zoom-controls">
+    <div class="zoom-btn" onclick="changeZoom(0.3)">+</div>
+    <div class="zoom-btn" onclick="changeZoom(-0.3)">-</div>
+</div>
+
+<!-- NAVIGATION CARD -->
+<div id="navCard">
+    <div class="card-header" id="dragHeader">
+        <div class="nav-title">TOGGLE NAVIGATION</div>
+    </div>
+    
+    <select id="targetSelect">
+        <option value="-1">-- SELECT DESTINATION --</option>
+        <option value="0">C BUILDING</option>
+        <option value="99">H BUILDING</option> <!-- CUSTOM PATH ID -->
+        <option value="2">POST BUILDING</option>
+        <option value="3">LIBRARY</option>
+        <option value="4">FOUNTAIN</option>
+        <option value="6">PASSAGE 1 ENTRY</option>
+        <option value="7">PASSAGE 1 MIDDLE</option>
+        <option value="8">PASSAGE 1 EXIT</option>
+    </select>
+    
+    <div class="btn-row">
+        <button class="btn-start" onclick="startNav()">START</button>
+        <button class="btn-stop" onclick="stopNav()">STOP</button>
+    </div>
+    
+    <div class="status-box">
+        <div class="status-row">
+            <span class="status-text" id="status-display">WAITING...</span>
+            <span class="gps-stats" id="sat-display">SAT: 0</span>
+        </div>
+        <div class="meta-text">DIST: <span id="nav-dist">0.0</span> m | LAT: <span id="dbg-lat">--</span></div>
+    </div>
+</div>
+
+<canvas id="mapCanvas"></canvas>
+
+<script>
+// ===========================================
+// 1. MAP DATA (WAYPOINTS & BUILDINGS) - UNCHANGED
+// ===========================================
+const REF = { lat: 48.82987, lng: 12.95516 }; 
+const SCALE = 600000; 
+
+const TARGETS = [
+  {id:0, name: "C BUILDING", lat: 48.829922, lng: 12.955285},
+  {id:1, name: "H BUILDING", lat: 48.829474, lng: 12.954294},
+  {id:2, name: "POST BUILDING", lat: 48.830017, lng: 12.954980},
+  {id:3, name: "LIBRARY", lat: 48.829511, lng: 12.955618},
+  {id:4, name: "FOUNTAIN", lat: 48.82990, lng: 12.95506},
+  {id:6, name: "PASSAGE 1 ENTRY", lat: 48.829705, lng: 12.954905},
+  {id:7, name: "PASSAGE 1 MIDDLE", lat: 48.829610, lng: 12.954840},
+  {id:8, name: "PASSAGE 1 EXIT", lat: 48.829505, lng: 12.954751},
+  {id:10, name: "TREAT1", lat: 48.829451, lng: 12.954694},
+  {id:11, name: "TREAT2", lat: 48.829395, lng: 12.954624},
+  {id:12, name: "TREAT3", lat: 48.829340, lng: 12.954589},
+  {id:13, name: "TREAT4", lat: 48.829295, lng: 12.954510},
+  {id:14, name: "TREAT5", lat: 48.829315, lng: 12.954421},
+  {id:15, name: "TREAT6", lat: 48.829360, lng: 12.954315},
+  {id:16, name: "TREAT7", lat: 48.829400, lng: 12.954263},
+  {id:17, name: "TREAT8", lat: 48.829672, lng: 12.955116},
+  {id:18, name: "TREAT9", lat: 48.829589, lng: 12.955322},
+  {id:19, name: "PASSAGE 2 ENTRY", lat: 48.829477, lng: 12.955534},
+  {id:20, name: "PASSAGE 2 MIDDLE", lat: 48.829390, lng: 12.955461},
+  {id:21, name: "PASSAGE 2 EXIT", lat: 48.829296, lng: 12.955406},
+  {id:22, name: "TREAT10", lat: 48.829312, lng: 12.955182}
+];
+
+const BUILDINGS = [
+    {name:"FOUNTAIN", pts:[{lat:48.8299, lng:12.955}, {lat:48.82988, lng:12.95506}, {lat:48.82984, lng:12.95502}, {lat:48.82986, lng:12.95496}]},
+    {name:"B Building", pts:[{lat:48.83035, lng:12.95462}, {lat:48.8302, lng:12.95452}, {lat:48.83, lng:12.95508}, {lat:48.83016, lng:12.9552}]},
+    {name:"C Building", pts:[{lat:48.82997, lng:12.95518}, {lat:48.83009, lng:12.95527}, {lat:48.82964, lng:12.95654}, {lat:48.82952, lng:12.95645}]},
+    {name:"Library", pts:[{lat:48.82957, lng:12.9561}, {lat:48.82968, lng:12.95579}, {lat:48.8295, lng:12.95564}, {lat:48.82939, lng:12.95595}]},
+    {name:"Campus Store", pts:[{lat:48.82973, lng:12.95567}, {lat:48.82955, lng:12.95553}, {lat:48.82971, lng:12.95509}, {lat:48.82988, lng:12.95523}]},
+    {name:"Pool Stage", pts:[{lat:48.83005, lng:12.95473}, {lat:48.82988, lng:12.95459}, {lat:48.82998, lng:12.95432}, {lat:48.83015, lng:12.95446}]},
+    {name:"D Building", pts:[{lat:48.82995, lng:12.95422}, {lat:48.82975, lng:12.95406}, {lat:48.82953, lng:12.95469}, {lat:48.82972, lng:12.95485}]},
+    {name:"E Building", pts:[{lat:48.82969, lng:12.95494}, {lat:48.82949, lng:12.95479}, {lat:48.82929, lng:12.95537}, {lat:48.82948, lng:12.9555}]},
+    {name:"E1 Building", pts:[{lat:48.82946, lng:12.95558}, {lat:48.82927, lng:12.95543}, {lat:48.82905, lng:12.95606}, {lat:48.82923, lng:12.95621}]},
+    {name:"H Building", pts:[{lat:48.82957, lng:12.95434}, {lat:48.82937, lng:12.95418}, {lat:48.82947, lng:12.95389}, {lat:48.82967, lng:12.95406}]},
+    {name:"Garden", pts:[{lat:48.82952, lng:12.95439}, {lat:48.8294, lng:12.95429}, {lat:48.82932, lng:12.95448}, {lat:48.82944, lng:12.9546}]}
+];
+
+const BOUNDARY = [
+    {lat:48.82971, lng:12.95658}, {lat:48.82902, lng:12.95607}, {lat:48.82947, lng:12.95474}, 
+    {lat:48.82924, lng:12.95459}, {lat:48.82952, lng:12.95384}, {lat:48.83042, lng:12.95457}
+];
+
+const WAYPOINTS = [
+  {id:0, lat:48.82987, lng:12.95516}, {id:1, lat:48.82995, lng:12.95525},
+  {id:2, lat:48.82980, lng:12.95500},
+  {id:30, lat:48.82965, lng:12.95530}, {id:31, lat:48.82955, lng:12.95550},
+  {id:40, lat:48.82940, lng:12.95450}, {id:50, lat:48.82975, lng:12.95480},
+  
+  // New Waypoints to increase resolution 
+  {id:70, lat:48.82985, lng:12.95535}, {id:71, lat:48.82975, lng:12.95545}, 
+  {id:72, lat:48.82935, lng:12.95500}, {id:73, lat:48.83015, lng:12.95505}, 
+  {id:74, lat:48.83020, lng:12.95485}, {id:75, lat:48.82990, lng:12.95450}, 
+  {id:76, lat:48.82920, lng:12.95460}, {id:77, lat:48.82915, lng:12.95580}, 
+  {id:78, lat:48.82960, lng:12.95415}, {id:79, lat:48.82990, lng:12.95475}, 
+  {id:80, lat:48.82970, lng:12.95430}, {id:81, lat:48.82950, lng:12.95580}, 
+  {id:82, lat:48.82930, lng:12.95600}, {id:83, lat:48.82990, lng:12.95630}, 
+
+  // CUSTOM PATH WAYPOINTS (PASSAGE 1 + TREAT PATH)
+  {id:6, lat: 48.829705, lng: 12.954905},      // PASSAGE 1 ENTRY
+  {id:7, lat: 48.829610, lng: 12.954840},      // PASSAGE 1 MIDDLE
+  {id:8, lat: 48.829505, lng: 12.954751},      // PASSAGE 1 EXIT
+  {id:10, lat: 48.829451, lng: 12.954694},     // TREAT1
+  {id:11, lat: 48.829395, lng: 12.954624},     // TREAT2
+  {id:12, lat: 48.829340, lng: 12.954589},     // TREAT3
+  {id:13, lat: 48.829295, lng: 12.954510},     // TREAT4
+  {id:14, lat: 48.829315, lng: 12.954421},     // TREAT5
+  {id:15, lat: 48.829360, lng: 12.954315},     // TREAT6
+  {id:16, lat: 48.829400, lng: 12.954263},     // TREAT7
+
+  // DUPLICATE WAYPOINTS (IDs > 100)
+  {id:100, lat:48.82980, lng:12.95512}, {id:101, lat:48.82990, lng:12.95518},
+  {id:102, lat:48.82970, lng:12.95505}, {id:103, lat:48.82985, lng:12.95480},
+  {id:110, lat:48.83000, lng:12.95470}, {id:111, lat:48.83005, lng:12.95460}, {id:112, lat:48.83000, lng:12.95498}, 
+  {id:120, lat:48.82970, lng:12.95450}, {id:121, lat:48.82955, lng:12.95420}, 
+  {id:130, lat:48.82970, lng:12.95540}, {id:131, lat:48.82960, lng:12.95560},
+  {id:140, lat:48.82935, lng:12.95440}, {id:150, lat:48.82980, lng:12.95470},
+
+  {id:170, lat:48.82980, lng:12.95530}, {id:171, lat:48.82970, lng:12.95540}, 
+  {id:172, lat:48.82930, lng:12.95505}, {id:173, lat:48.83020, lng:12.95510}, 
+  {id:174, lat:48.83025, lng:12.95480}, {id:175, lat:48.82995, lng:12.95455}, 
+  {id:176, lat:48.82925, lng:12.95465}, {id:177, lat:48.82920, lng:12.95585}, 
+  {id:178, lat:48.82965, lng:12.95420}, {id:179, lat:48.82995, lng:12.95480}, 
+  {id:180, lat:48.82975, lng:12.95435}, {id:181, lat:48.82955, lng:12.95585}, 
+  {id:182, lat:48.82935, lng:12.95605}, {id:183, lat:48.82995, lng:12.95635},
+];
+
+
+// ===========================================
+// 2. LOGIC & PATHFINDING
+// ===========================================
+const cvs = document.getElementById('mapCanvas');
+const ctx = cvs.getContext('2d');
+let curLat=0, curLng=0, curHead=0;
+let plannedPath = [];
+let targetWaypointIndex = 1; 
+
+// View State
+let zoomLevel = 1.0;
+let camX = 0, camY = 0;
+let isDraggingMap = false;
+let startDragX=0, startDragY=0;
+
+const MAP_ROTATION_DEG = 315; 
+const MAP_ROTATION_RAD = MAP_ROTATION_DEG * Math.PI / 180;
+
+function resize(){ cvs.width = window.innerWidth; cvs.height = window.innerHeight; }
+window.addEventListener('resize', resize); 
+resize();
+
+function toXY(lat, lng) {
+    let x = -((lng - REF.lng) * Math.cos(REF.lat * Math.PI/180) * SCALE);
+    let y = (lat - REF.lat) * SCALE; 
+    return {x, y};
+}
+
+function getDist(p1, p2) {
+    const R=6371e3; const f1=p1.lat*Math.PI/180; const f2=p2.lat*Math.PI/180;
+    const df=(p2.lat-p1.lat)*Math.PI/180; const dl=(p2.lng-p1.lng)*Math.PI/180;
+    const a=Math.sin(df/2)*Math.sin(df/2) + Math.cos(f1)*Math.cos(f2)*Math.sin(dl/2)*Math.sin(dl/2);
+    return R*2*Math.atan2(Math.sqrt(a),Math.sqrt(1-a));
+}
+
+function getBearing(p1, p2) {
+    const lat1 = p1.lat * Math.PI/180;
+    const lat2 = p2.lat * Math.PI/180;
+    const dlng = (p2.lng - p1.lng) * Math.PI/180;
+
+    const y = Math.sin(dlng) * Math.cos(lat2);
+    const x = Math.cos(lat1) * Math.sin(lat2) - Math.sin(lat1) * Math.cos(lat2) * Math.cos(dlng);
+    
+    let bearing = Math.atan2(y, x) * 180 / Math.PI;
+    return (bearing + 360) % 360; 
+}
+
+
+// --- DRAGGABLE UI (kept for brevity) ---
+const card = document.getElementById("navCard");
+const header = document.getElementById("dragHeader");
+let isDraggingCard = false;
+let offsetX, offsetY;
+
+header.addEventListener('mousedown', (e) => {
+    isDraggingCard = true;
+    const rect = card.getBoundingClientRect();
+    offsetX = e.clientX - rect.left;
+    offsetY = e.clientY - rect.top;
+});
+
+document.addEventListener('mousemove', (e) => {
+    if(isDraggingCard) {
+        card.style.transform = 'none'; 
+        card.style.left = (e.clientX - offsetX) + 'px';
+        card.style.top = (e.clientY - offsetY) + 'px';
+        if(e.clientX - offsetX + card.offsetWidth > window.innerWidth) card.style.left = (window.innerWidth - card.offsetWidth) + 'px';
+        if(e.clientX - offsetX < 0) card.style.left = '0px';
+    }
+});
+document.addEventListener('mouseup', () => { isDraggingCard = false; });
+
+
+// --- PAN & ZOOM (kept for brevity) ---
+cvs.addEventListener('mousedown', e => { isDraggingMap = true; startDragX = e.clientX - camX; startDragY = e.clientY - camY; });
+cvs.addEventListener('mousemove', e => { if(isDraggingMap) { camX = e.clientX - startDragX; camY = e.clientY - startDragY; } });
+cvs.addEventListener('mouseup', () => isDraggingMap = false);
+cvs.addEventListener('wheel', e => { e.preventDefault(); changeZoom(e.deltaY * -0.001); });
+
+function changeZoom(delta) { zoomLevel = Math.min(Math.max(0.2, zoomLevel + delta), 5); }
+
+
+// --- PATHFINDING ALGORITHM (kept for brevity) ---
+function intersect(p1,p2,p3,p4) {
+    const ccw = (a,b,c) => (c.y-a.y)*(b.x-a.x) > (b.y-a.y)*(c.x-a.x); 
+    const a = toXY(p1.lat,p1.lng), b = toXY(p2.lat,p2.lng);
+    const c = toXY(p3.lat,p3.lng), d = toXY(p4.lat,p4.lng);
+    return (ccw(a,c,d) != ccw(b,c,d)) && (ccw(a,b,c) != ccw(a,b,d));
+}
+
+function isPathClear(n1, n2) {
+    for(let b of BUILDINGS) {
+        for(let i=0; i<b.pts.length; i++) {
+            if(intersect(n1, n2, b.pts[i], b.pts[(i+1)%b.pts.length])) return false;
+        }
+    }
+    return true;
+}
+
+function calcPath(start, end) {
+    let nodes = [...WAYPOINTS, {id:'S',lat:start.lat,lng:start.lng}, {id:'E',lat:end.lat,lng:end.lng}];
+    let adj = {}; nodes.forEach(n => adj[n.id] = []);
+    
+    const LINK_DISTANCE_THRESHOLD = 1000; 
+    
+    for(let i=0; i<nodes.length; i++) {
+        for(let j=i+1; j<nodes.length; j++) {
+            if(getDist(nodes[i], nodes[j]) < LINK_DISTANCE_THRESHOLD && isPathClear(nodes[i], nodes[j])) {
+                let d = getDist(nodes[i], nodes[j]);
+                adj[nodes[i].id].push({n:nodes[j], d:d}); adj[nodes[j].id].push({n:nodes[i], d:d});
+            }
+        }
+    }
+    
+    let open = [{id:'S', f:0}], cameFrom = {}, gScore = {}, fScore = {};
+    nodes.forEach(n => { gScore[n.id] = Infinity; fScore[n.id] = Infinity; });
+    gScore['S'] = 0; fScore['S'] = getDist(start, end);
+    
+    while(open.length > 0) {
+        open.sort((a,b) => a.f - b.f);
+        let curr = open.shift().id;
+        if(curr === 'E') {
+            let path = [], temp = 'E';
+            while(temp in cameFrom){ path.unshift(nodes.find(n => n.id == temp)); temp = cameFrom[temp]; }
+            path.unshift(nodes.find(n => n.id == 'S'));
+            return path;
+        }
+        if(!adj[curr]) continue;
+        for(let nbr of adj[curr]) {
+            let tg = gScore[curr] + nbr.d;
+            if(tg < gScore[nbr.n.id]) {
+                cameFrom[nbr.n.id] = curr; gScore[nbr.n.id] = tg; fScore[nbr.n.id] = tg + getDist(nbr.n, end);
+                if(!open.some(x => x.id === nbr.n.id)) open.push({id:nbr.n.id, f:fScore[nbr.n.id]});
+            }
+        }
+    }
+    return [];
+}
+
+
+// --- NAVIGATION COMMAND LOGIC (MODIFIED FOR ROBOT DOG) ---
+const WAYPOINT_TOLERANCE = 5;       // 5m for reaching a waypoint
+const FINE_ALIGNMENT_DIST = 1.5;    // Distance for fine alignment commands (Step Left/Right)
+const TURN_THRESHOLD_DEG = 20;      // Angle to stop moving and start a major turn
+const BACKWARD_THRESHOLD_DEG = 140; // Angle to issue a 'Turn Around' command
+const ALIGNMENT_ERROR_DEG = 5;      // Small angle for 'Step' commands
+
+function getNavigationInstruction() {
+    const currentPos = {lat: curLat, lng: curLng};
+    // Calculate final distance only once
+    const distanceToFinal = plannedPath.length > 0 ? getDist(currentPos, plannedPath[plannedPath.length-1]) : 0.0;
+    
+    // 1. Destination Reached Check
+    if (plannedPath.length < 2 || targetWaypointIndex >= plannedPath.length) {
+        return {instruction: "DESTINATION REACHED", targetBearing: curHead, dist: 0.0};
+    }
+
+    const nextTarget = plannedPath[targetWaypointIndex];
+    const distanceToTarget = getDist(currentPos, nextTarget);
+
+    // 2. Waypoint Reached Check & Advance
+    if (distanceToTarget < WAYPOINT_TOLERANCE) {
+        if(targetWaypointIndex < plannedPath.length - 1) {
+            targetWaypointIndex++; 
+            const newTarget = plannedPath[targetWaypointIndex];
+            const newTargetBearing = getBearing(currentPos, newTarget);
+            
+            // Recalculate heading error for the new target immediately
+            let headingError = newTargetBearing - curHead;
+            if (headingError > 180) headingError -= 360;
+            if (headingError < -180) headingError += 360;
+            
+            let turnInstruction;
+            if (Math.abs(headingError) > BACKWARD_THRESHOLD_DEG) {
+                 turnInstruction = "TURN AROUND (180°)";
+            } else if (Math.abs(headingError) > TURN_THRESHOLD_DEG) {
+                 // Forces a discrete turn command upon reaching the node
+                 turnInstruction = (headingError > 0) ? "TURN RIGHT" : "TURN LEFT";
+            } else {
+                 turnInstruction = "GO STRAIGHT (ALIGNED)"; // Already aligned for the next leg
+            }
+            
+            // Return the next command right away
+            return {instruction: "NEXT WP: " + turnInstruction, targetBearing: newTargetBearing, dist: distanceToFinal};
+        } else {
+            targetWaypointIndex = plannedPath.length; 
+            // FINAL DESTINATION REACHED
+            return {instruction: "DESTINATION REACHED", targetBearing: curHead, dist: 0.0};
+        }
+    }
+
+    // 3. Calculate Required Heading and Error to Current Target
+    const targetBearing = getBearing(currentPos, nextTarget);
+    let headingError = targetBearing - curHead;
+
+    // Normalize error to [-180, 180]
+    if (headingError > 180) headingError -= 360;
+    if (headingError < -180) headingError += 360;
+    
+    let instruction;
+
+    // 4. Fine Alignment/Step Commands (Near the next waypoint)
+    if (distanceToTarget < FINE_ALIGNMENT_DIST) {
+        if (Math.abs(headingError) > TURN_THRESHOLD_DEG) {
+             // If close but misaligned, still force a major turn
+             instruction = (headingError > 0) ? "TURN RIGHT" : "TURN LEFT";
+        } else if (Math.abs(headingError) > ALIGNMENT_ERROR_DEG) {
+            // Small heading error near the point: use STEP
+            instruction = (headingError > 0) ? "STEP RIGHT" : "STEP LEFT";
+        } else {
+            instruction = "GO STRAIGHT (ALIGNED)";
+        }
+    } 
+    // 5. Major Turn Commands (Far from the next waypoint)
+    else if (Math.abs(headingError) > BACKWARD_THRESHOLD_DEG) {
+        instruction = "TURN AROUND (180°)";
+    } else if (Math.abs(headingError) > TURN_THRESHOLD_DEG) {
+        instruction = (headingError > 0) ? "TURN RIGHT" : "TURN LEFT";
+    }
+    // 6. Go Straight Command
+    else {
+        instruction = "GO STRAIGHT (" + distanceToTarget.toFixed(1) + "m)";
+    }
+
+    return {instruction, targetBearing, dist: distanceToFinal};
+}
+
+function sendNavInstruction(instructionObj) {
+    if (instructionObj.instruction.startsWith("DESTINATION REACHED")) {
+        fetch('/set_target?id=-1'); 
+    }
+    // Update the distance on the UI
+    document.getElementById('nav-dist').innerText = instructionObj.dist.toFixed(1);
+
+    // Send the simplified instruction string to the server
+    fetch('/nav_cmd?cmd=' + encodeURIComponent(instructionObj.instruction));
+}
+
+
+// --- CONTROLS (Kept Unchanged) ---
+function startNav() {
+    let id = document.getElementById('targetSelect').value;
+    if(id == -1) return;
+    
+    let startPoint = (curLat == 0) ? REF : {lat:curLat, lng:curLng}; 
+    let serverTargetID = id; 
+
+    if (id === '99') {
+        const H_BUILDING_ID = 1;
+        const CUSTOM_PATH_IDS = [6, 7, 8, 10, 11, 12, 13, 14, 15, 16, H_BUILDING_ID]; 
+        serverTargetID = H_BUILDING_ID; 
+        
+        let fullCustomPath = [];
+        CUSTOM_PATH_IDS.forEach(wpID => {
+            const wp = TARGETS.find(x => x.id === wpID) || WAYPOINTS.find(x => x.id === wpID);
+            if(wp) fullCustomPath.push(wp);
+        });
+
+        if (fullCustomPath.length === 0) {
+            alert("Custom Path Error: Waypoints not found.");
+            return;
+        }
+
+        let closestDist = Infinity;
+        let closestIndex = 0; 
+        
+        for(let i = 0; i < fullCustomPath.length; i++) {
+            const dist = getDist(startPoint, fullCustomPath[i]);
+            if (dist < closestDist) {
+                closestDist = dist;
+                closestIndex = i;
+            }
+        }
+        
+        if (closestDist < WAYPOINT_TOLERANCE) {
+             if (closestIndex < fullCustomPath.length - 1) {
+                 closestIndex++; 
+             } else {
+                 alert("Already at or near the final destination!");
+                 return;
+             }
+        }
+        
+        const remainingPath = fullCustomPath.slice(closestIndex);
+        
+        plannedPath = [{id:'S', lat:startPoint.lat, lng:startPoint.lng}, ...remainingPath];
+        
+        if (plannedPath.length <= 1) {
+            alert("Path error after calculating closest point.");
+            plannedPath = [];
+            return;
+        }
+    } 
+    else {
+        let t = TARGETS.find(x => x.id == id);
+        if(!t) return;
+        
+        plannedPath = calcPath(startPoint, t); 
+    }
+    
+    if(plannedPath.length == 0) {
+        alert("Path Blocked or Too Far!");
+    } else {
+        targetWaypointIndex = 1; 
+        fetch('/set_target?id=' + serverTargetID); 
+    }
+}
+
+function stopNav() {
+    plannedPath = [];
+    targetWaypointIndex = 1;
+    fetch('/set_target?id=-1');
+    document.getElementById('status-display').innerText = "STOPPED";
+}
+
+// --- DRAWING LOOP (map rotation applied) - UNCHANGED ---
+function draw() {
+    ctx.clearRect(0, 0, cvs.width, cvs.height);
+    const cx = cvs.width / 2, cy = cvs.height / 2;
+    
+    ctx.save();
+    ctx.translate(cx + camX, cy + camY); 
+    ctx.scale(zoomLevel, zoomLevel);
+    
+    ctx.rotate(MAP_ROTATION_RAD);
+
+    const cXY = toXY(REF.lat, REF.lng); 
+    ctx.translate(-cXY.x, -cXY.y);
+    
+    // --- Draw Grid (omitted for brevity) ---
+    const GRID_STEP = 20; 
+    const GRID_COLOR = "#0e0e0e"; 
+    const EXTENT = 5000; 
+    
+    ctx.strokeStyle = GRID_COLOR;
+    ctx.lineWidth = 0.5;
+    
+    for(let x = -EXTENT; x <= EXTENT; x += GRID_STEP) {
+        ctx.beginPath(); ctx.moveTo(x, -EXTENT); ctx.lineTo(x, EXTENT); ctx.stroke();
+    }
+    for(let y = -EXTENT; y <= EXTENT; y += GRID_STEP) {
+        ctx.beginPath(); ctx.moveTo(-EXTENT, y); ctx.lineTo(EXTENT, y); ctx.stroke();
+    }
+    
+    // Draw Boundary
+    ctx.beginPath();
+    BOUNDARY.forEach((p,i) => { const xy = toXY(p.lat, p.lng); (i==0)?ctx.moveTo(xy.x, xy.y):ctx.lineTo(xy.x, xy.y); });
+    ctx.closePath(); ctx.strokeStyle = "#333"; ctx.setLineDash([5,5]); ctx.stroke(); ctx.setLineDash([]);
+    
+    // Draw Buildings
+    BUILDINGS.forEach(b => {
+        ctx.beginPath();
+        b.pts.forEach((p,i) => { const xy = toXY(p.lat, p.lng); (i==0)?ctx.moveTo(xy.x, xy.y):ctx.lineTo(xy.x, xy.y); });
+        ctx.closePath(); ctx.fillStyle = "#222"; ctx.fill(); ctx.strokeStyle = "#00e676"; ctx.lineWidth = 1; ctx.stroke();
+        let tx=0, ty=0; b.pts.forEach(p => { const t = toXY(p.lat, p.lng); tx += t.x; ty += t.y; });
+        
+        // Compensate text rotation to keep it readable
+        ctx.save();
+        ctx.translate(tx/b.pts.length, ty/b.pts.length);
+        ctx.rotate(-MAP_ROTATION_RAD); 
+        ctx.fillStyle = "#888"; ctx.font = "8px Arial"; ctx.textAlign = "center"; ctx.fillText(b.name, 0, 0);
+        ctx.restore();
+    });
+    
+    // Draw Path
+    if(plannedPath.length > 1) {
+        ctx.beginPath();
+        plannedPath.forEach((p,i) => { const xy = toXY(p.lat, p.lng); (i==0)?ctx.moveTo(xy.x, xy.y):ctx.lineTo(xy.x, xy.y); });
+        ctx.strokeStyle = "#00e676"; ctx.lineWidth = 3; ctx.lineJoin = "round"; ctx.stroke();
+
+        // Draw waypoints in the path
+        plannedPath.forEach(p => {
+            const xy = toXY(p.lat, p.lng);
+            ctx.fillStyle = (p.id == 1) ? '#ff0000' : '#9c27b0'; 
+            ctx.beginPath(); ctx.arc(xy.x, xy.y, 3, 0, 6.28); ctx.fill();
+        });
+    }
+    
+    // Draw Targets
+    TARGETS.forEach(t => {
+        const xy = toXY(t.lat, t.lng);
+        ctx.fillStyle = (t.id == 1) ? '#ff0000' : '#9c27b0'; 
+        ctx.beginPath(); ctx.arc(xy.x, xy.y, 5, 0, 6.28); ctx.fill();
+        ctx.fillStyle = "white"; ctx.font = "bold 10px Arial"; ctx.fillText(t.name, xy.x, xy.y + 12);
+    });
+    
+    // Draw Robot (Green Arrow)
+    if (curLat != 0) {
+        const rXY = toXY(curLat, curLng);
+        ctx.save(); 
+        ctx.translate(rXY.x, rXY.y); 
+        ctx.rotate((curHead + 45) * Math.PI / 180); 
+        ctx.fillStyle = "#00e676"; 
+        ctx.beginPath(); ctx.moveTo(0, -10); ctx.lineTo(6, 6); ctx.lineTo(0, 3); ctx.lineTo(-6, 6); ctx.fill();
+        ctx.restore();
+    }
+    
+    ctx.restore();
+}
+
+// --- DATA LOOP (MODIFIED to use instruction object) ---
+setInterval(() => {
+    fetch('/data').then(r => r.json()).then(d => {
+        curLat = d.lat; curLng = d.lng; curHead = d.head;
+        document.getElementById('sat-display').innerText = "SAT: " + d.sats;
+        document.getElementById('dbg-lat').innerText = d.lat.toFixed(6);
+
+        // 2. Navigation Logic 
+        if (d.status.includes("ACTIVE") && plannedPath.length > 1 && curLat != 0) {
+            const instructionObj = getNavigationInstruction();
+            sendNavInstruction(instructionObj);
+            
+            // Update UI with the instruction string
+            document.getElementById('status-display').innerText = instructionObj.instruction;
+
+        } else {
+            document.getElementById('status-display').innerText = d.status;
+        }
+        
+        draw();
+    });
+}, 1000); 
+</script>
+</body>
+</html>
+)rawliteral";
+  server.send(200, "text/html", mapHtml);
+}
+
+// ==========================================
+// 5. DATA HANDLING & FILTERING LOGIC (UNCHANGED)
+// ==========================================
+
+double distanceMeters(double lat1, double lon1, double lat2, double lon2) {
+  double R = 6371e3; 
+  double phi1 = lat1 * PI / 180.0;
+  double phi2 = lat2 * PI / 180.0;
+  double dphi = (lat2 - lat1) * PI / 180.0;
+  double dlam = (lon2 - lon1) * PI / 180.0;
+  double a = sin(dphi/2) * sin(dphi/2) + cos(phi1) * cos(phi2) * sin(dlam/2) * sin(dlam/2);
+  double c = 2 * atan2(sqrt(a), sqrt(1-a));
+  return R * c;
+}
+
+void metersToDeltaLatLng(double dx, double dy, double currentLat, double& dLat, double& dLng) {
+    static const double ONE_DEG_LAT = 111320.0; 
+    
+    double currentLatRad = currentLat * PI / 180.0;
+    double oneDegLng = ONE_DEG_LAT * cos(currentLatRad);
+
+    dLat = dy / ONE_DEG_LAT;  
+    dLng = dx / oneDegLng;    
+}
+
+void handleData() {
+  String json = "{";
+  json += "\"lat\":" + String(currentLat, 8) + ","; 
+  json += "\"lng\":" + String(currentLng, 8) + ",";
+  json += "\"head\":" + String(currentHeading, 2) + ",";
+  json += "\"sats\":" + String(satCount) + ",";
+  json += "\"status\":\"" + navStatus + "\"";
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+void handleSetTarget() {
+  if (server.hasArg("id")) {
+    activeTargetID = server.arg("id").toInt();
+    // If target is -1 (from DESTINATION REACHED), set navStatus to STOPPED
+    if(activeTargetID == -1) navStatus = "STOPPED";
+    else navStatus = "ACTIVE";
+  }
+  server.send(200, "text/plain", "OK");
+}
+
+void handleNavCommand() {
+  if (server.hasArg("cmd")) {
+    // The received command will be one of the discrete instructions (e.g., "TURN RIGHT", "DESTINATION REACHED")
+    navStatus = server.arg("cmd");
+  }
+  server.send(200, "text/plain", "OK");
+}
+
+// ==========================================
+// 6. MAIN SETUP & LOOP (UNCHANGED)
+// ==========================================
+void setup() {
+  Serial.begin(115200);
+  
+  // WiFi
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
+  Serial.println("\nIP: http://" + WiFi.localIP().toString());
+  
+  // Hardware
+  gpsSerial.begin(GPSBaud, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+  if(!bno.begin()) Serial.println("IMU Error"); else bno.setExtCrystalUse(true);
+
+  // Server
+  server.on("/", handleMapPage);
+  server.on("/data", handleData);
+  server.on("/set_target", handleSetTarget);
+  server.on("/nav_cmd", handleNavCommand); 
+  server.begin();
+
+  // Initialize DR timer
+  lastDRTime = millis();
+}
+
+void loop() {
+  server.handleClient();
+  
+  // =========================================
+  // 1. DEAD RECKONING (IMU Integration)
+  // =========================================
+  unsigned long now = millis();
+  double dt = (now - lastDRTime) / 1000.0; 
+  lastDRTime = now;
+  
+  const double ACCEL_THRESHOLD = 0.15; 
+  const double VEL_DECAY = 0.98;       
+
+  if (dt > 0.005) { 
+    
+    // A. Read IMU
+    sensors_event_t event; 
+    bno.getEvent(&event);
+    currentHeading = event.orientation.x; 
+    
+    // Get Linear Acceleration Vector (m/s^2)
+    imu::Vector<3> linearAccel = bno.getVector(Adafruit_BNO055::VECTOR_LINEARACCEL);
+    
+    // B. Rotate Acceleration Vector from IMU Frame to World Frame (North/East)
+    double headingRad = currentHeading * PI / 180.0;
+    double acc_N_raw = (linearAccel.x() * cos(headingRad)) - (linearAccel.y() * sin(headingRad)); 
+    double acc_E_raw = (linearAccel.x() * sin(headingRad)) + (linearAccel.y() * cos(headingRad)); 
+    
+    // C. Apply Thresholding and D. Integrate Velocity
+    double acc_magnitude = sqrt(acc_E_raw * acc_E_raw + acc_N_raw * acc_N_raw);
+
+    double acc_N = 0.0;
+    double acc_E = 0.0;
+
+    if (acc_magnitude > ACCEL_THRESHOLD) {
+        acc_N = acc_N_raw;
+        acc_E = acc_E_raw;
+    }
+    velX += acc_E * dt;
+    velY += acc_N * dt;
+
+    // E. Apply Velocity Decay (ZUPT effect)
+    if (acc_magnitude <= ACCEL_THRESHOLD) {
+      velX *= VEL_DECAY;
+      velY *= VEL_DECAY;
+      if (abs(velX) < 0.005) velX = 0.0; 
+      if (abs(velY) < 0.005) velY = 0.0;
+    }
+
+    // F. Integrate Position
+    double dx = velX * dt; 
+    double dy = velY * dt; 
+    
+    // G. Convert meters displacement to Lat/Lng difference and H. Update DR position
+    double dLat, dLng;
+    if(drLat != 0.0) { 
+      metersToDeltaLatLng(dx, dy, drLat, dLat, dLng);
+      drLat += dLat;
+      drLng += dLng;
+      
+      currentLat = drLat;
+      currentLng = drLng;
+    }
+  }
+
+
+  // =========================================
+  // 2. GPS READING & DR CORRECTION (IMU/GPS CALIBRATION)
+  // =========================================
+  while (gpsSerial.available() > 0) {
+    if (gps.encode(gpsSerial.read())) {
+      satCount = gps.satellites.value();
+
+      if (gps.location.isValid() && gps.location.age() < 5000) { 
+        double rawLat = gps.location.lat();
+        double rawLng = gps.location.lng();
+
+        if (rawLat != 0.0 && rawLng != 0.0) {
+          
+          // --- DR Initialization & Correction ---
+          if (drLat == 0.0) { 
+             drLat = rawLat;
+             drLng = rawLng;
+             currentLat = rawLat;
+             currentLng = rawLng;
+             velX = 0.0;
+             velY = 0.0;
+             navStatus = "GPS LOCKED. STANDBY.";
+          } else {
+             // Subsequent Lock: Correct DR state
+             double dist = distanceMeters(drLat, drLng, rawLat, rawLng); 
+             
+             if (dist > 5.0) { 
+                drLat = rawLat;
+                drLng = rawLng;
+                velX = 0.0; 
+                velY = 0.0;
+             } else if (dist > 1.0) {
+                // Weighted correction (blending GPS with DR) for drift reduction
+                const double ALPHA_CORRECTION = 0.1; 
+                drLat = drLat * (1.0 - ALPHA_CORRECTION) + rawLat * ALPHA_CORRECTION;
+                drLng = drLng * (1.0 - ALPHA_CORRECTION) + rawLng * ALPHA_CORRECTION;
+                velX *= 0.8; 
+                velY *= 0.8;
+             }
+             currentLat = drLat;
+             currentLng = drLng;
+          }
+        }
+      } else {
+         if (satCount < 3) navStatus = "WEAK GPS SIGNAL (DR Active)";
+      }
+    }
+  }
+
+  // --- Fallback if DR has not been initialized by GPS but IMU is working ---
+  if(drLat == 0.0 && currentHeading != 0.0) {
+     navStatus = "DR STANDBY - NEED GPS LOCK";
+  }
+}

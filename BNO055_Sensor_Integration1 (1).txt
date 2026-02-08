@@ -1,0 +1,1859 @@
+/*****************************************************
+ * FINAL INTEGRATED SKETCH (V37.4 - Conceptual Heading Control)
+ * - MODULES: BNO055 IMU (Quaternion Fix), 5x Ultrasonic, NEO-6M GPS, SSD1306 OLED
+ * - HOSTS: Unified Web Dashboard (Full Sensors + Camera View)
+ *
+ * CHANGES:
+ * 1. LOGIC: Added Simple Dead Reckoning (DR) logic using Linear Acceleration and Heading.
+ * 2. LOGIC: Implemented **Conceptual Heading Control** using 'targetHeading' and 'calculateTurnCorrection'.
+ * 3. LOGIC: Control logic now uses IMU error to determine if a turn is complete (within 5 deg).
+ * 4. LOGIC: Added 'Left-Correct' / 'Right-Correct' directions for minor drift correction (>= 2 deg).
+ * 5. WEB: Added Dead Reckoning data (X, Y, VX, VY) display and a dedicated 'RESET DR' button.
+ * 6. WEB: New server endpoint: /resetDR to reset the position variables.
+ *****************************************************/
+
+#include <WiFi.h>
+#include <esp_now.h>
+#include <WebServer.h>       
+#include <Wire.h>          
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BNO055.h>
+#include <utility/imumaths.h>
+#include <TinyGPSPlus.h>
+#include <HardwareSerial.h>
+
+// === ADDED: OLED LIBRARIES ===
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// ===================================================
+// === GLOBAL SETTINGS & IMU CONFIG ===
+// ===================================================
+
+const char* ssid = "ESP32_CAM_AP";      // Your WiFi SSID
+const char* password = "12345678";      // Your WiFi Password
+const int LED_PIN = 2;   
+
+// ⚠ CRITICAL: PASTE THE IP ADDRESS FROM THE CAM'S SERIAL MONITOR HERE!
+const char* cameraIP = "192.168.4.1";  
+const int cameraPort = 80;
+
+// BNO055 PINS and Object
+#define I2C_SCL_PIN 22
+#define I2C_SDA_PIN 21  
+Adafruit_BNO055 bno = Adafruit_BNO055(55, 0x28);  
+
+typedef struct { char cmd[20]; } espMessage_t;
+
+WebServer server(80);
+bool bno_initialized = false;
+float currentHeading = 0.0, currentRoll = 0.0, currentPitch = 0.0;
+
+// BNO055 GLOBAL STORAGE (Calibration Status & Raw Vectors)
+uint8_t sys_cal = 0, gyro_cal = 0, accel_cal = 0, mag_cal = 0;
+float currentAx = 0.0, currentAy = 0.0, currentAz = 0.0; // Accelerometer (m/s^2)
+float currentGx = 0.0, currentGy = 0.0, currentGz = 0.0; // Gyroscope (dps)
+float currentMx = 0.0, currentMy = 0.0, currentMz = 0.0; // Magnetometer (uT)
+float currentA_Mag = 0.0; // Acceleration Magnitude (Total G-Force)
+float currentLAx = 0.0, currentLAy = 0.0, currentLAz = 0.0; // Linear Acceleration (m/s^2 - Gravity Removed)
+
+// QUATERNION DATA (for robust visualization)
+float currentQw = 0.0, currentQx = 0.0, currentQy = 0.0, currentQz = 0.0;
+
+// === NEW: HEADING CONTROL GLOBALS ===
+float targetHeading = 0.0; // The desired compass direction (0-360 deg)
+// ====================================
+
+// === NEW: DEAD RECKONING GLOBAL STORAGE ===
+float estimatedPosX = 0.0; // Estimated position X (meters, East-West)
+float estimatedPosY = 0.0; // Estimated position Y (meters, North-South)
+float estimatedVelX = 0.0; // Estimated velocity X (m/s)
+float estimatedVelY = 0.0; // Estimated velocity Y (m/s)
+
+unsigned long lastDRUpdate = 0; // Time tracking for dead reckoning loop
+const float DR_UPDATE_INTERVAL_MS = 100.0; // 100ms update rate
+// ===========================================
+
+
+// ===================================================
+// === GPS CONFIG & GLOBAL STORAGE ===
+// ===================================================
+
+static const int GPS_RX_PIN = 16;  // Connect to NEO-6M TX
+static const int GPS_TX_PIN = 17;  // Connect to NEO-6M RX
+static const uint32_t GPSBaud = 9600;  
+
+// --- Timezone Configuration (CET) ---
+static const long TIMEZONE_OFFSET_SEC = 3600; // +1 hour for CET
+
+TinyGPSPlus gps;
+HardwareSerial gpsSerial(2); // Use Serial2
+
+float currentLat = 0.0;
+float currentLng = 0.0;
+float currentAlt = 0.0;
+String currentTimeStr = "No Fix"; // Holds HH:MM:SS (CET)
+String currentDateStr = "No Fix"; // Holds DD/MM/YYYY
+
+
+// ===================================================
+// === LIDAR CONFIG & GLOBAL STORAGE ===
+// ===================================================
+
+HardwareSerial lidarSerial(1); // Use Serial1 (UART1)
+#define LIDAR_RX_PIN 27
+#define LIDAR_TX_PIN 33
+#define LIDAR_BAUDRATE 115200  
+#define MOTOR_PIN 12  
+
+const int PACKET_SIZE = 5;  
+const int MAX_LIDAR_RANGE_MM = 12000;  
+const int MIN_LIDAR_FILTER_MM = 30;    
+const int MAX_PACKETS_PER_POLL = 500;  
+const int LIDAR_SMOOTH_WINDOW = 5;
+
+// GLOBAL Lidar storage
+int globalMinLidarDist = MAX_LIDAR_RANGE_MM;  
+float globalMinLidarAngle = -1.0;  
+int minLidarFront = MAX_LIDAR_RANGE_MM;
+int minLidarBack = MAX_LIDAR_RANGE_MM;
+int minLidarLeft = MAX_LIDAR_RANGE_MM;
+int minLidarRight = MAX_LIDAR_RANGE_MM;
+
+int lidarSmoothBuffer[LIDAR_SMOOTH_WINDOW];
+int lidarSmoothIndex = 0;
+
+
+// =========================================================
+// ==== ULTRASONIC SENSOR DEFINITIONS & GLOBAL STORAGE ====
+// =========================================================
+
+#define TRIG_FRONT 32
+#define ECHO_FRONT 25
+
+#define TRIG_BACK 5
+#define ECHO_BACK 14
+
+#define TRIG_LEFT 4
+#define ECHO_LEFT 18
+
+#define TRIG_RIGHT 13
+#define ECHO_RIGHT 19
+
+#define TRIG_45DEG 23  
+#define ECHO_45DEG 26
+
+long distFront = 0, distBack = 0, distLeft = 0, distRight = 0, distDeg45 = 0;
+
+// Non-blocking timer for Ultrasonic readings
+unsigned long lastUSRead = 0;
+const long US_INTERVAL = 100;  
+
+
+// ===================================================
+// === ROBOT STATE MANAGEMENT ===
+// ===================================================
+
+enum RobotState { MOVING, STOPPED, TURNING };  
+enum SensorMode { LIDAR_MODE, ULTRASONIC_MODE };
+
+RobotState currentState = MOVING;
+SensorMode currentMode = LIDAR_MODE;  
+String currentDirection = "Forward";  
+
+
+// ===================================================
+// === ADDED: OLED CONFIG & GLOBAL STATUS (MODIFIED) ===
+// ===================================================
+
+#define SCREEN_WIDTH 128 // OLED display width, in pixels
+#define SCREEN_HEIGHT 32 // OLED display height, in pixels
+#define OLED_RESET -1    // Reset pin # (or -1 if sharing Arduino reset pin)
+#define SCREEN_ADDRESS 0x3C ///< I2C address for most 128x32 OLEDs
+
+// Declare the OLED display object
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// Global variable to hold the message for the OLED
+String oledStatusMessage = "INITIALIZING...";
+unsigned long oledDisplayTimeout = 0; // To track how long a message should be shown
+
+
+/**
+ * @brief Updates the OLED display with the current status message and live data.
+ * The logic prioritizes: Temporary Message > Welcome Message > Live Status.
+ */
+void updateOLED() {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setFont(NULL); // Use default font
+  
+  // --- STATE 1/2: TEMPORARY or WELCOME MESSAGE ---
+  if (millis() < oledDisplayTimeout) {
+    
+    // Welcome message is a special case to display in two lines
+    if (oledStatusMessage.equals("WELCOME BY TEAM 5")) {
+      display.setTextSize(2);
+      display.setCursor(0, 0); // Top line
+      display.println("WELCOME");
+      display.setCursor(0, 16); // Second line (16 pixels down)
+      display.println("TEAM 5");
+
+    } else {
+      // Temporary Command (STOPPING, HEADING TO)
+      display.setTextSize(2);
+      
+      // Use custom fitting for the temporary command messages to fit 2 lines
+      if (oledStatusMessage.startsWith("GOING:") || oledStatusMessage.equals("STOPPING...")) {
+          
+          if (oledStatusMessage.startsWith("GOING:")) {
+            display.setTextSize(1);
+            display.setCursor(0, 0);
+            display.println("COMMAND:");
+            display.setTextSize(2);
+            display.setCursor(0, 16);
+            // Print the target name part
+            display.println(oledStatusMessage.substring(6));
+          } else { // STOPPING...
+            display.setTextSize(2);
+            // Center single line
+            int16_t x1, y1; uint16_t w, h;
+            display.getTextBounds(oledStatusMessage, 0, 0, &x1, &y1, &w, &h);
+            display.setCursor((SCREEN_WIDTH - w) / 2, (SCREEN_HEIGHT - 16) / 2);
+            display.println(oledStatusMessage);
+          }
+
+      } else {
+          // Default fallback for any other temporary message
+          display.setTextSize(1);
+          display.setCursor(0, 0);
+          display.println("CMD ACTIVE:");
+          display.setCursor(0, 16);
+          display.println(oledStatusMessage);
+      }
+    }
+    
+    display.display();
+    return; // Exit here, don't show live status yet
+  }
+  
+  // --- STATE 3: LIVE ROBOT STATUS (3 lines, standard size 1) ---
+  
+  // If the timeout has passed, reset the status to the default live message base
+  if (oledStatusMessage.equals("STOPPING...") || oledStatusMessage.startsWith("GOING:") || oledStatusMessage.equals("WELCOME BY TEAM 5")) {
+    oledStatusMessage = "LIVE STATUS"; 
+  }
+  
+  display.setTextSize(1);
+  
+  // LINE 1 (Y=0): Detection Mode
+  display.setCursor(0, 0);
+  String modeString = currentMode == LIDAR_MODE ? "Mode: LIDAR" : "Mode: USONIC";
+  display.println(modeString);
+  
+  // LINE 2 (Y=10): Movement Action (Robot State)
+  display.setCursor(0, 10);
+  String stateString;
+  // This logic must map the robot state/direction to a useful action description
+  if (currentState == MOVING && currentDirection.startsWith("Forward")) {
+      stateString = "Action: FREE FWD";
+  } else if (currentState == MOVING && currentDirection.endsWith("Correct")) {
+      stateString = "Action: Correcting";
+  } else if (currentState == STOPPED) {
+      stateString = "Action: STOPPED";
+  } else if (currentState == TURNING) {
+      stateString = "Action: TURNING";
+  } else {
+      stateString = "Action: MOVING"; // Catch-all for other MOVING states
+  }
+  display.println(stateString);
+
+  // LINE 3 (Y=20): Target Direction
+  display.setCursor(0, 20);
+  display.println("Dir: " + currentDirection);
+
+  display.display();
+}
+
+
+// ===================================================
+// === UTILITY & SENSOR FUNCTIONS (Omitted for brevity) ===
+// ===================================================
+
+// Ultrasonic reading function
+long readDistance(int trigPin, int echoPin) {
+  // ... (Ultrasonic logic remains unchanged)
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);    
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+
+  long duration = pulseIn(echoPin, HIGH, 40000);  
+  
+  if (duration == 0) return 0;  
+  
+  long distanceCM = (duration * 0.0343) / 2;  
+  
+  if (distanceCM > 400) return 400;  
+  return distanceCM;
+}
+
+// RESTORED: All 5 Ultrasonic readings
+void readAllUltrasonicSensors() {
+  distFront = readDistance(TRIG_FRONT, ECHO_FRONT);  
+  distBack = readDistance(TRIG_BACK, ECHO_BACK);    
+  distLeft = readDistance(TRIG_LEFT, ECHO_LEFT);    
+  distRight = readDistance(TRIG_RIGHT, ECHO_RIGHT);  
+  distDeg45 = readDistance(TRIG_45DEG, ECHO_45DEG);    
+}
+
+// Lidar smoothing helper
+int smoothedLidarValue(int newVal) {
+  const int LIDAR_SMOOTH_WINDOW = 5;
+  const int MAX_LIDAR_RANGE_MM = 12000;
+  
+  lidarSmoothBuffer[lidarSmoothIndex++] = newVal;
+  if (lidarSmoothIndex >= LIDAR_SMOOTH_WINDOW) lidarSmoothIndex = 0;
+  long sum = 0; int cnt = 0;
+  for (int i = 0; i < LIDAR_SMOOTH_WINDOW; i++) {
+    if (lidarSmoothBuffer[i] < MAX_LIDAR_RANGE_MM) { sum += lidarSmoothBuffer[i]; cnt++; }
+  }
+  if (cnt == 0) return MAX_LIDAR_RANGE_MM;
+  return (int)(sum / cnt);
+}
+
+void startLidarMotor() {
+    pinMode(MOTOR_PIN, OUTPUT);
+    digitalWrite(MOTOR_PIN, HIGH);  
+    Serial.println("Lidar Motor Started.");
+    delay(500);  
+}
+
+String getLidarScanJson() {
+    // ... (Lidar JSON creation logic remains unchanged)
+    const int PACKET_SIZE = 5;
+    const int MAX_LIDAR_RANGE_MM = 12000;
+    const int MIN_LIDAR_FILTER_MM = 30;
+    const int MAX_PACKETS_PER_POLL = 500;
+
+    String json = "{\"scan\":[";
+    int pointCount = 0;
+    int minDistance = MAX_LIDAR_RANGE_MM;  
+    float minAngle = -1.0;  
+    
+    // Reset Quadrant minimums before new scan
+    minLidarFront = MAX_LIDAR_RANGE_MM;
+    minLidarBack = MAX_LIDAR_RANGE_MM;
+    minLidarLeft = MAX_LIDAR_RANGE_MM;
+    minLidarRight = MAX_LIDAR_RANGE_MM;
+    
+    for(int i = 0; i < MAX_PACKETS_PER_POLL; i++) {
+        
+        if (lidarSerial.available() < PACKET_SIZE) {  
+            break;  
+        }
+        
+        byte peekByte = lidarSerial.peek();
+        if (peekByte == 0x00 || peekByte == 0xA5 || peekByte == 0x5A) {
+            lidarSerial.read();  
+            continue;
+        }
+        
+        // Read and Parse the Packet
+        byte packet[PACKET_SIZE];
+        lidarSerial.readBytes(packet, PACKET_SIZE);
+
+        int distance = packet[3] | ((packet[4] & 0x7F) << 8);  
+        int raw_angle = packet[1] | ((packet[2] & 0x7F) << 8);  
+        float angle = (float)raw_angle / 64.0;  
+
+        if (distance > MIN_LIDAR_FILTER_MM && distance < MAX_LIDAR_RANGE_MM && angle >= 0.0 && angle < 360.0) {  
+            
+            if (distance < minDistance) {
+                minDistance = distance;
+                minAngle = angle;  
+            }
+
+            // Quadrant Minima Calculation (0 degrees = front)
+            int roundedAngle = (int)angle;
+            if (roundedAngle >= 315 || roundedAngle < 45) { // Front (315-045)
+                minLidarFront = min(minLidarFront, distance);
+            } else if (roundedAngle >= 45 && roundedAngle < 135) { // Right (045-135)
+                minLidarRight = min(minLidarRight, distance);
+            } else if (roundedAngle >= 135 && roundedAngle < 225) { // Back (135-225)
+                minLidarBack = min(minLidarBack, distance);
+            } else if (roundedAngle >= 225 && roundedAngle < 315) { // Left (225-315)
+                minLidarLeft = min(minLidarLeft, distance);
+            }
+
+            if (pointCount > 0) {
+                json += ",";  
+            }
+            json += "{\"a\":" + String(angle, 1) + ",\"d\":" + String(distance) + "}";
+            pointCount++;
+        }
+        
+        // Increased micro delay for stability
+        delayMicroseconds(500);  
+    }
+    
+    // Smooth global minDistance
+    minDistance = smoothedLidarValue(minDistance);
+    globalMinLidarDist = minDistance;  
+    globalMinLidarAngle = minAngle;
+
+    json += "]}";
+
+    String finalJson = "{\"min_dist\":" + String(minDistance) + ",\"min_angle\":" + String(minAngle, 1) + "," + json.substring(1);
+
+    return finalJson;
+}
+
+
+// ===================================================
+// === IMU & GPS FUNCTIONS (MODIFIED for QUATERNION) ===
+// ===================================================
+
+void blinkLED(int times) {
+  for (int i = 0; i < times; i++) {
+    digitalWrite(LED_PIN, HIGH);
+    delay(300);
+    digitalWrite(LED_PIN, LOW);
+    delay(300);
+  }
+}
+
+void readIMU() {
+  if (bno_initialized) {
+    // 1. Fused Orientation (Euler Angles - Kept for dashboard H/R/P display)
+    sensors_event_t event;
+    bno.getEvent(&event);
+    currentHeading = event.orientation.x;
+    currentRoll = event.orientation.y;
+    currentPitch = event.orientation.z;
+
+    // 2. Calibration Status
+    bno.getCalibration(&sys_cal, &gyro_cal, &accel_cal, &mag_cal);
+    
+    // 3. FUSED QUATERNION DATA (NEW - For robust 3D visualization)
+    imu::Quaternion quat = bno.getQuat();
+    currentQw = quat.w();
+    currentQx = quat.x();
+    currentQy = quat.y();
+    currentQz = quat.z();
+
+    // 4. Raw Acceleration (m/s^2)
+    imu::Vector<3> accel_vec = bno.getVector(Adafruit_BNO055::VECTOR_ACCELEROMETER);
+    currentAx = accel_vec.x(); currentAy = accel_vec.y(); currentAz = accel_vec.z();
+    currentA_Mag = sqrt(currentAx*currentAx + currentAy*currentAy + currentAz*currentAz);
+
+    // 5. Linear Acceleration (m/s^2 - Gravity Removed)
+    imu::Vector<3> linear_accel_vec = bno.getVector(Adafruit_BNO055::VECTOR_LINEARACCEL);
+    currentLAx = linear_accel_vec.x();  
+    currentLAy = linear_accel_vec.y();  
+    currentLAz = linear_accel_vec.z();
+
+    // 6. Raw Gyroscope (dps)
+    imu::Vector<3> gyro_vec = bno.getVector(Adafruit_BNO055::VECTOR_GYROSCOPE);
+    currentGx = gyro_vec.x(); currentGy = gyro_vec.y(); currentGz = gyro_vec.z();
+    
+    // 7. Raw Magnetometer (uT)
+    imu::Vector<3> mag_vec = bno.getVector(Adafruit_BNO055::VECTOR_MAGNETOMETER);
+    currentMx = mag_vec.x(); currentMy = mag_vec.y(); currentMz = mag_vec.z();
+  }
+}
+
+/**
+ * @brief Performs basic Dead Reckoning using Linear Acceleration and Heading.
+ * NOTE: This is a MINIMAL integration (Euler integration) and will drift quickly.
+ * It serves as a proof-of-concept for X/Y tracking.
+ */
+void updateDeadReckoning() {
+    unsigned long now = millis();
+    // Only proceed if the update interval has passed
+    if (now - lastDRUpdate < DR_UPDATE_INTERVAL_MS) {
+        return; 
+    }
+    
+    // Calculate the time delta (dt) in seconds
+    float dt = (float)(now - lastDRUpdate) / 1000.0f; 
+    lastDRUpdate = now;
+    
+    // --- 1. Get Acceleration in the Robot's FRAME (already done by BNO055 linear accel) ---
+    float accelX = currentLAx; // Forward/Backward acceleration
+    float accelY = currentLAy; // Side-to-Side acceleration
+
+    // --- 2. Update Velocity (V = V0 + a*dt) in the Robot's FRAME ---
+    // Simple filter: only update if acceleration is above a threshold to ignore noise
+    const float ACCEL_THRESHOLD = 0.1; // m/s^2 
+    if (abs(accelX) > ACCEL_THRESHOLD) {
+      estimatedVelX += accelX * dt;
+    } else {
+      // Apply simple drag/friction model if no significant acceleration
+      estimatedVelX *= 0.95; // Decay
+    }
+
+    if (abs(accelY) > ACCEL_THRESHOLD) {
+      estimatedVelY += accelY * dt;
+    } else {
+      estimatedVelY *= 0.95; // Decay
+    }
+    
+    // --- 3. Convert Velocity from Robot's FRAME to GLOBAL (X/Y) FRAME (Rotation) ---
+    // Heading (Yaw) is the angle relative to North (0 deg). 
+    float headingRad = (currentHeading) * DEG_TO_RAD;
+    
+    // Simple 2D Rotation: GlobalX = Ax*sin(H) + Ay*cos(H), GlobalY = Ax*cos(H) - Ay*sin(H)
+    float cosH = cos(headingRad);
+    float sinH = sin(headingRad);
+    
+    // Global Y (North/South) component: (Forward vel * cosH) - (Sideways vel * sinH)
+    float globalVelY = (estimatedVelX * cosH) - (estimatedVelY * sinH);
+    
+    // Global X (East/West) component: (Forward vel * sinH) + (Sideways vel * cosH)
+    float globalVelX = (estimatedVelX * sinH) + (estimatedVelY * cosH);
+    
+    // --- 4. Update Position (P = P0 + V*dt) in the Global Frame ---
+    estimatedPosX += globalVelX * dt; // East/West movement (meters)
+    estimatedPosY += globalVelY * dt; // North/South movement (meters)
+}
+
+/**
+ * @brief Calculates the shortest angle to turn (in degrees) to reach the target heading.
+ * @param current: Current Heading (0-360)
+ * @param target: Target Heading (0-360)
+ * @return float: Positive value for right turn, negative for left turn.
+ */
+float calculateTurnCorrection(float current, float target) {
+    float error = target - current;
+    
+    // Normalize error to be between -180 and 180 degrees (shortest path)
+    if (error > 180.0f) {
+        error -= 360.0f;
+    } else if (error < -180.0f) {
+        error += 360.0f;
+    }
+    
+    return error;
+}
+
+
+// Handler for the Yaw Reset Button (NEW IMU LOGIC)
+void handleYawReset() {
+    // This is purely for acknowledging the client-side button press.
+    server.send(200, "text/plain", "Visual Yaw Offset Reset Signal Sent.");
+}
+
+// Handler for the Dead Reckoning Reset Button (NEW DR LOGIC)
+void handleDRReset() {
+    estimatedPosX = 0.0;
+    estimatedPosY = 0.0;
+    estimatedVelX = 0.0;
+    estimatedVelY = 0.0;
+    
+    server.send(200, "text/plain", "Dead Reckoning Reset Complete.");
+}
+
+
+void readGPS() {
+  while (gpsSerial.available() > 0) {
+    if (gps.encode(gpsSerial.read())) {
+      if (gps.location.isValid()) {
+        currentLat = gps.location.lat();
+        currentLng = gps.location.lng();
+      }
+      if (gps.altitude.isValid()) {
+        currentAlt = gps.altitude.meters();
+      }
+      
+      // Update Time and Date (CET = UTC+1)
+      if (gps.date.isValid() && gps.time.isValid()) {
+        
+        // Get the UTC time in seconds since midnight
+        long time_sec = (long)gps.time.hour() * 3600L +
+                          (long)gps.time.minute() * 60L +
+                          (long)gps.time.second();
+        
+        // Apply the timezone offset (CET = +1 hour)
+        time_sec += TIMEZONE_OFFSET_SEC;  
+
+        // Calculate CET time components
+        // Handle 24-hour wrap for day change
+        int current_hour = (time_sec / 3600L) % 24;
+        int current_minute = (time_sec % 3600L) / 60L;
+        int current_second = time_sec % 60L;
+        
+        // Format time string (HH:MM:SS)
+        char timeBuffer[9];
+        sprintf(timeBuffer, "%02d:%02d:%02d", current_hour, current_minute, current_second);
+        currentTimeStr = String(timeBuffer);
+
+        // Format date string (DD/MM/YYYY)
+        char dateBuffer[11];
+        // Note: Full date roll-over logic is complex, generally best handled by RTOS or relying on next GPS sentence.
+        // For simple display, we use the raw date, which is mostly fine unless it's midnight.
+        sprintf(dateBuffer, "%02d/%02d/%04d", gps.date.day(), gps.date.month(), gps.date.year());
+        currentDateStr = String(dateBuffer);
+      } else {
+        currentTimeStr = "No Fix";
+        currentDateStr = "No Fix";
+      }
+    }
+  }
+}
+
+// ===================================================
+// === ESP-NOW RECEIVER (MODIFIED for OLED) ===
+// ===================================================
+
+void OnDataRecv(const esp_now_recv_info *info, const uint8_t *data, int len) {
+  espMessage_t msg;
+  memcpy(&msg, data, sizeof(msg));
+  Serial.print("📩 Received command: ");
+  Serial.println(msg.cmd);
+
+  if (strcmp(msg.cmd, "STOP") == 0) {
+      blinkLED(1);
+      oledStatusMessage = "STOPPING...";
+      oledDisplayTimeout = millis() + 3000; // Show "STOPPING..." for 3 seconds (2.5)
+  } else if (strcmp(msg.cmd, "POST BUILDING") == 0) {
+      blinkLED(2);
+      // Use "GOING: " prefix to trigger custom 2-line display in updateOLED()
+      oledStatusMessage = "GOING: POST BLD"; 
+      oledDisplayTimeout = millis() + 3000; // Show this message for 3 seconds (2.3)
+  } else if (strcmp(msg.cmd, "H BUILDING") == 0) {
+      blinkLED(3);
+      // Use "GOING: " prefix to trigger custom 2-line display in updateOLED()
+      oledStatusMessage = "GOING: H BLD"; 
+      oledDisplayTimeout = millis() + 3000; // Show this message for 3 seconds (2.3)
+  }
+}
+
+// ===================================================
+// === WEB SERVER FUNCTIONS (Master Dashboard) ===
+// ===================================================
+
+void handleData() {
+  
+  String json = "{";
+  
+  // IMU Calibration Status  
+  json += "\"Cal_S\":" + String(sys_cal) + ",";
+  json += "\"Cal_G\":" + String(gyro_cal) + ",";
+  json += "\"Cal_A\":" + String(accel_cal) + ",";
+  json += "\"Cal_M\":" + String(mag_cal) + ",";
+  
+  // IMU Fused Orientation (Euler Angles)
+  json += "\"Heading\":" + String(currentHeading, 2) + ",";
+  json += "\"Roll\":" + String(currentRoll, 2) + ",";
+  json += "\"Pitch\":" + String(currentPitch, 2) + ",";
+  
+  // IMU Fused Quaternion (NEW - For robust 3D visualization)
+  json += "\"Qw\":" + String(currentQw, 4) + ",";
+  json += "\"Qx\":" + String(currentQx, 4) + ",";
+  json += "\"Qy\":" + String(currentQy, 4) + ",";
+  json += "\"Qz\":" + String(currentQz, 4) + ",";
+
+  // IMU Raw Vectors
+  json += "\"AX\":" + String(currentAx, 2) + ",";
+  json += "\"AY\":" + String(currentAy, 2) + ",";
+  json += "\"AZ\":" + String(currentAz, 2) + ",";
+  json += "\"AMag\":" + String(currentA_Mag, 2) + ",";  
+  json += "\"GX\":" + String(currentGx, 2) + ",";
+  json += "\"GY\":" + String(currentGy, 2) + ",";
+  json += "\"GZ\":" + String(currentGz, 2) + ",";
+  // FIX: Added Magnetometer values explicitly
+  json += "\"MX\":" + String(currentMx, 2) + ",";
+  json += "\"MY\":" + String(currentMy, 2) + ",";
+  json += "\"MZ\":" + String(currentMz, 2) + ",";  
+  
+  // NEW: Linear Acceleration (Used for Dead Reckoning)
+  json += "\"LAX\":" + String(currentLAx, 2) + ",";
+  json += "\"LAY\":" + String(currentLAy, 2) + ",";
+  json += "\"LAZ\":" + String(currentLAz, 2) + ",";  
+
+  // === NEW: DEAD RECKONING DATA ===
+  json += "\"DR_X\":" + String(estimatedPosX, 3) + ",";
+  json += "\"DR_Y\":" + String(estimatedPosY, 3) + ",";
+  json += "\"DR_VX\":" + String(estimatedVelX, 3) + ",";
+  json += "\"DR_VY\":" + String(estimatedVelY, 3) + ",";
+  // =================================
+  
+  // Send ALL 5 Ultrasonic sensor data
+  json += "\"Front\":" + String(distFront) + ",";  
+  json += "\"Back\":"  + String(distBack) + ",";  
+  json += "\"Left\":"  + String(distLeft) + ",";  
+  json += "\"Right\":" + String(distRight) + ",";  
+  json += "\"Deg45\":" + String(distDeg45) + ",";
+  
+  // GPS Data
+  json += "\"Latitude\":" + String(currentLat, 6) + ",";
+  json += "\"Longitude\":" + String(currentLng, 6) + ",";
+  json += "\"Altitude\":" + String(currentAlt, 2) + ",";
+  // GPS Time/Date
+  json += "\"Time\":\"" + currentTimeStr + "\",";  
+  json += "\"Date\":\"" + currentDateStr + "\",";
+  
+  // Robot State & Lidar Minimas
+  json += "\"mode\":\"" + String(currentMode == LIDAR_MODE ? "LIDAR_MODE" : "ULTRASONIC_MODE") + "\",";
+  
+  // FIX: Map currentState to include "FREE_TO_GO" for the webpage
+  String stateString;
+  if (currentState == MOVING && currentDirection.startsWith("Forward")) {
+      stateString = "FREE_TO_GO";
+  } else if (currentState == MOVING) {
+      stateString = "MOVING";
+  } else if (currentState == STOPPED) {
+      stateString = "STOPPED";
+  } else {
+      stateString = "TURNING";
+  }
+  json += "\"state\":\"" + stateString + "\",";
+  
+  json += "\"direction\":\"" + currentDirection + "\",";
+  json += "\"lidar_min\":" + String(globalMinLidarDist) + ",";
+  json += "\"lidar_f\":" + String(minLidarFront) + ",";
+  json += "\"lidar_b\":" + String(minLidarBack) + ",";
+  json += "\"lidar_l\":" + String(minLidarLeft) + ",";
+  json += "\"lidar_r\":" + String(minLidarRight);  
+  
+  json += "}";
+  
+  server.send(200, "application/json", json);
+}
+
+void handleLidarJson() {
+  server.send(200, "application/json", getLidarScanJson());
+}
+
+void handleRoot() {
+  String camAddress = "http://" + String(cameraIP) + ":" + String(cameraPort);
+  
+  // NOTE: HTML is a raw string literal. The closing delimiter MUST be exactly )rawliteral";
+  const char* htmlContent = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>MASTER ROBOT DASHBOARD</title>
+    <style>
+        body { 
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;  
+            text-align: center;  
+            margin-top: 30px;  
+            background-color: #f8f9fa;  
+            color: #343a40;
+            transition: background-color 0.3s, color 0.3s; /* Smooth transition for dark mode */
+        }
+        h1 { color: #007bff; margin-bottom: 20px; } /* Light Mode: Primary Blue */
+        
+        /* === NEW: Two-Column Layout Container (Adjusted for better centering) === */
+        .main-data-container {
+             display: flex;  
+             justify-content: center;  
+             flex-wrap: wrap;  
+             gap: 20px;  
+             margin-bottom: 20px;
+             max-width: 900px; /* Increased max-width for better two-column spacing */
+             margin-left: auto; /* Center the container */
+             margin-right: auto;
+        }
+        .data-column {
+            display: flex;
+            flex-direction: column; /* Stacks boxes vertically within the column */
+            gap: 0; /* CRUCIAL: REMOVE GAP BETWEEN DATA BOXES */
+            flex: 1 1 420px; /* Adjusted base size */
+            max-width: 420px; /* Adjusted max width */
+        }
+        .data-column .data-box {
+             margin-bottom: 20px; /* Add margin back if separating groups, but keep gap 0 */
+        }
+        /* Specifically target boxes that should be directly adjacent (Status & Lidar, IMU & GPS) */
+        .left-column .status-box { 
+             margin-bottom: 0; /* Remove margin below status box to join it with Lidar box */
+             border-bottom-left-radius: 0;
+             border-bottom-right-radius: 0;
+        }
+        .left-column .lidar-display {
+             margin-top: 0; /* Remove margin above lidar box to join it with status box */
+             border-top-left-radius: 0;
+             border-top-right-radius: 0;
+             margin-bottom: 20px; /* Re-add spacing below the joined group */
+        }
+        .right-column .data-box:nth-child(1) { /* IMU Box */
+             margin-bottom: 0; /* Remove margin below IMU box to join it with GPS box */
+             border-bottom-left-radius: 0;
+             border-bottom-right-radius: 0;
+        }
+        .right-column .data-box:nth-child(2) { /* GPS Box */
+             margin-top: 0; /* Remove margin above GPS box to join it with IMU box */
+             border-top-left-radius: 0;
+             border-top-right-radius: 0;
+        }
+
+        .data-box {
+            background-color: white;
+            padding: 20px;
+            border-radius: 12px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+            min-width: 320px;  
+            width: 100%; /* Important: makes box fill the column */
+            transition: background-color 0.3s, box-shadow 0.3s, border-color 0.3s;
+            text-align: center; /* Set default text alignment to CENTER */
+        }
+        .status-box { min-width: 300px; }  
+        
+        /* All Headings Capitalized and Centered */
+        h2 { 
+            color: #343a40; 
+            margin-top: 0; 
+            border-bottom: 1px solid #dee2e6; 
+            padding-bottom: 10px; 
+            transition: color 0.3s, border-color 0.3s;
+            text-transform: uppercase;
+            text-align: center !important; /* Force center alignment for all h2 */
+        }
+        h3 { 
+            text-transform: uppercase;
+            text-align: center; /* Center align h3 */
+        }
+        
+        p { margin: 5px 0; }  
+        p#lidar-canvas-container { text-align: center !important; } /* Override for the info text */
+
+        /* --- Lidar Styles --- */
+        #lidar-canvas {
+            border: 1px solid #ced4da;
+            margin-top: 5px;  
+            background-color: #fff;  
+            transition: background-color 0.3s, border-color 0.3s;
+            display: block; /* Important for centering the canvas */
+            margin: 0 auto;
+        }
+        
+        /* --- Calibration Status Table Styling (MODIFIED FOR COMPACT LOOK) --- */
+        .right-column table {
+             border-collapse: collapse !important; /* Remove gaps between cells */
+             border-spacing: 0 !important; /* Ensure no border spacing */
+             width: 100% !important; 
+             margin-left: auto; 
+             margin-right: auto;
+             text-align: center; 
+        }
+        .right-column table th, .right-column table td {
+            border: 1px solid #ddd !important; /* Bring back visible borders */
+            padding: 4px 8px !important; /* Standard compact padding */
+            text-align: center; /* Center content in cells */
+        }
+        .cal-status { 
+            display: inline-block; 
+            padding: 2px 4px; 
+            border-radius: 4px;
+        }
+        /* --- End Calibration Status Table Styling --- */
+
+        
+        /* --- IMU Styles: Cube and Data Alignment --- */
+        .imu-gps-data { font-size: 0.9em; margin-top: 10px; }
+        .imu-gps-data p { margin: 3px 0; }
+        .imu-gps-data .value { color: #dc3545; font-weight: bold; }
+        
+        /* Force text alignment for IMU details to the center */
+        .right-column .data-box p { text-align: center; }
+        .right-column .data-box h3 { border-bottom-style: dashed; }
+        
+        /* Center tables and buttons explicitly in the IMU box */
+        .right-column .reset-btn { 
+            margin-left: auto;
+            margin-right: auto;
+            display: block; 
+        }
+        .right-column .cube-container { margin: 10px auto 20px auto; }
+        
+        /* Calibration Status Styles */
+        .cal-red { background-color: #f8d7da; color: #721c24; }  
+        .cal-yellow { background-color: #fff3cd; color: #856404; }  
+        .cal-green { background-color: #d4edda; color: #155724; }  
+        
+        /* --- NEW 3D CUBE STYLES (Keep Primary Blue) --- */
+        .cube-container {
+            width: 100px;
+            height: 100px;
+            margin: 10px auto 20px auto;  
+            perspective: 500px;  
+            transform-style: preserve-3d;
+        }
+        .cube {
+            width: 100%;
+            height: 100%;
+            position: relative;
+            transform-style: preserve-3d;
+            transform: rotateX(0deg) rotateY(0deg) rotateZ(0deg);  
+            transition: transform 0.2s;  
+        }
+        .face {
+            position: absolute;
+            width: 100px;
+            height: 100px;
+            border: 2px solid #343a40;
+            background-color: rgba(0, 123, 255, 0.4);  
+            color: white;
+            font-size: 14px;
+            font-weight: bold;
+            line-height: 100px;
+            text-align: center;
+        }
+        .front { transform: rotateY(0deg) translateZ(50px); background-color: #007bff; } /* IMU Cube Face Blue */
+        .back { transform: rotateY(180deg) translateZ(50px); }
+        .left { transform: rotateY(-90deg) translateZ(50px); }
+        .right { transform: rotateY(90deg) translateZ(50px); }
+        .top { transform: rotateX(90deg) translateZ(50px); }
+        .bottom { transform: rotateX(-90deg) translateZ(50px); }
+        .front-label { font-size: 10px; line-height: 100px; background: none; color: white; }
+
+        /* Camera Frame Style */
+        .cam-frame {
+            border:none; width:90%; height:600px; max-width:800px;  
+            box-shadow:0 4px 10px rgba(0,0,0,0.1); border-radius:8px; margin-top:20px;
+        }
+        
+        /* Reset Button Style - Keep Red */
+        .reset-btn {
+            background-color: #dc3545; /* Red */
+            color: white;
+            border: none;
+            padding: 8px 16px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-weight: bold;
+            margin-top: 10px;
+            transition: background-color 0.1s;
+        }
+        .reset-btn:hover { background-color: #c82333; }
+        
+        /* New: Team Details Modal Styles */
+        .modal {
+            display: none; 
+            position: fixed; 
+            z-index: 1; 
+            left: 0;
+            top: 0;
+            width: 100%; 
+            height: 100%; 
+            overflow: auto; 
+            background-color: rgba(0,0,0,0.4); 
+            padding-top: 60px;
+        }
+        .modal-content {
+            background-color: #fefefe;
+            color: #343333;
+            margin: 5% auto; 
+            padding: 20px;
+            border: 1px solid #888;
+            width: 80%;
+            max-width: 500px;
+            border-radius: 12px;
+        }
+        .close {
+            color: #aaa;
+            float: right;
+            font-size: 28px;
+            font-weight: bold;
+        }
+        .close:hover, .close:focus {
+            color: #000;
+            text-decoration: none;
+            cursor: pointer;
+        }
+
+        /* === DARK MODE STYLES (UPDATED) === */
+        .dark-mode {
+            background-color: #121212 !important;
+            color: #e0e0e0 !important;
+        }
+        .dark-mode h1 { color: #007bff !important; } /* Master Robot Dashboard Title (H1) in Blue */
+        .dark-mode h2, .dark-mode h3 { color: #bb86fc !important; }
+        .dark-mode h2 { border-bottom-color: #333 !important; }
+        .dark-mode .data-box {
+            background-color: #1e1e1e !important;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.3) !important;
+            border: 1px solid #333 !important;
+        }
+        .dark-mode .imu-gps-data .value, .dark-mode .distance-val { color: #f4511e !important; }
+        .dark-mode .cal-red { background-color: #58151c; color: #f9d7da; }  
+        .dark-mode .cal-yellow { background-color: #5e4701; color: #fff3cd; }  
+        .dark-mode .cal-green { background-color: #0b4f17; color: #d4edda; } 
+        .dark-mode #lidar-canvas { border-color: #444; background-color: #1e1e1e; }
+        .dark-mode #robot-mode { color: #82b1ff !important; }
+        .dark-mode #robot-state { color: #69f0ae !important; }
+        .dark-mode .modal-content {
+            background-color: #1e1e1e;
+            color: #e0e0e0;
+        }
+        .dark-mode .close { color: #aaa; }
+        
+        /* Dark mode overrides for explicit user request (Blue Cube, Red Reset Button) */
+        .dark-mode .reset-btn { background-color: #f44336; } /* Reset button remains red/orange in dark mode */
+        .dark-mode .front { background-color: #03a9f4; } /* Lighter Blue for visibility in dark mode */
+        .dark-mode .face { border-color: #e0e0e0; background-color: rgba(3, 169, 244, 0.4); }
+    </style>
+</head>
+<body>
+    
+    <!-- === Group 5 and Dark Mode Toggle (Centered/Flexible) === -->
+    <div id="top-controls" style="display: flex; justify-content: space-between; align-items: center; max-width: 920px; margin: 0 auto 20px auto;">
+        <div id="group-5-placeholder" style="text-align: left; padding: 10px; border: 1px solid #ccc; border-radius: 8px;">
+            <h3 style="margin-top: 0; margin-bottom: 5px; font-size: 1.1em; color: #007bff; text-transform: uppercase; text-align: left !important;">Case-Study: Cooperative and autonomous systems</h3>
+            <p style="font-size: 0.9em; margin: 0; text-align: left !important;">Group 5 Module</p>
+        </div>
+        
+        <div style="display: flex; gap: 10px;">
+            <!-- NEW: Team Details Button -->
+            <button id="team-details-button" class="reset-btn" style="margin-top:0; background-color: #007bff;">Team Details</button>
+            
+            <button id="dark-mode-toggle" class="reset-btn" style="margin-top:0; background-color: #6c757d;">Toggle Dark Mode</button>
+        </div>
+    </div>
+    
+    <h1>MASTER ROBOT DASHBOARD</h1>
+    <p>IP Address: <span id="ip-address">%IP_ADDRESS%</span></p>
+    
+    <div style='text-align:center; margin-bottom: 30px;'>
+        <!-- LIVE STREAM AND CONTROLLER (CENTERED) -->
+        <h2>LIVE STREAM AND CONTROLLER</h2>
+        <iframe class='cam-frame' src="%CAMERA_ADDRESS%" title='Camera Stream and Controller'></iframe>
+    </div>
+    
+    <div class="main-data-container">
+        
+        <!-- === LEFT COLUMN: ROBOT STATUS, LIDAR (CENTER ALIGNED, NO GAP) === -->
+        <div class="data-column left-column">
+            
+            <div class="data-box status-box">
+                <h2>Robot Status</h2>
+                <p>Detection Mode: <span id="robot-mode" style="font-weight:bold; color:#007bff;">--</span></p>
+                <p>Movement Action: <span id="robot-state" style="font-weight:bold; color:#28a745;">--</span></p> 
+                <p>Target Direction: <span id="robot-direction" style="font-weight:bold;">--</span></p>
+                <p>Lidar Nearest Obstacle (Global): <span id="lidar-mode-min">--</span></p>
+            </div>
+            
+            <div class="data-box lidar-display">
+                <h2>Lidar + Ultrasonic Detector</h2>
+                <p id="lidar-canvas-container" style="font-size:0.85em; color: gray; text-align: center;">Inner Curve (0-50cm): <span style='font-weight:bold; color:blue;'>Ultrasonic</span> | Outer Curve (50-100cm): <span style='font-weight:bold; color:red;'>Lidar</span></p>
+                
+                <canvas id="lidar-canvas" width="420" height="420"></canvas>  
+                
+            </div>
+            
+        </div>
+        
+        <!-- === RIGHT COLUMN: IMU, GPS (CENTER ALIGNED, NO GAP) === -->
+        <div class="data-column right-column">
+            
+            <div class="data-box">
+                <h2>BNO055 IMU & Calibration</h2>
+                
+                <div class="cube-container">
+                    <div id="orientation-cube" class="cube">
+                        <div class="face front"><span class="front-label">FRONT</span></div>
+                        <div class="face back"></div>
+                        <div class="face left"></div>
+                        <div class="face right"></div>
+                        <div class="face top"></div>
+                        <div class="face bottom"></div>
+                    </div>
+                </div>
+
+                <button class="reset-btn" onclick="resetYaw()" style="margin-right: 10px;">RESET VISUAL YAW</button>
+                <button class="reset-btn" onclick="resetDeadReckoning()" style="background-color: #28a745;">RESET DR</button>
+
+                <p style="font-weight:700; font-size: 0.9em; margin-bottom: 5px; margin-top: 15px; text-align: center;">Calibration Status (0-3: Uncalibrated-Full)</p>
+                <table style="width:100%; font-size: 0.85em; margin-bottom: 15px; border:none; text-align: center; border-collapse: collapse; border-spacing: 0; margin-left: auto; margin-right: auto;">
+                    <tr><th>Sys</th><th>Gyro</th><th>Accel</th><th>Mag</th></tr>
+                    <tr>
+                        <td><span class='cal-status' id='cal-sys'>--</span></td>
+                        <td><span class='cal-status' id='cal-gyro'>--</span></td>
+                        <td><span class='cal-status' id='cal-accel'>--</span></td>
+                        <td><span class='cal-status' id='cal-mag'>--</span></td>
+                    </tr>
+                </table>
+
+                <h3 style="font-size: 1em; margin: 5px 0 5px 0; border-bottom: 1px dashed #dee2e6;">Fused Orientation</h3>
+                <p>Heading (Yaw): <span class='value' id='heading'>--</span> deg</p>
+                <p>Roll: <span class='value' id='roll'>--</span> deg</p>
+                <p>Pitch: <span class='value' id='pitch'>--</span> deg</p>
+
+                <h3 style="font-size: 1em; margin: 10px 0 5px 0; border-bottom: 1px dashed #dee2e6;">Dead Reckoning (X, Y in meters)</h3>
+                <p style="margin-bottom: 5px;">Pos X (E/W): <span class='value' id='dr_x'>--</span> m | Pos Y (N/S): <span class='value' id='dr_y'>--</span> m</p>
+                <p style="margin-bottom: 5px;">Vel X (E/W): <span class='value' id='dr_vx'>--</span> m/s | Vel Y (N/S): <span class='value' id='dr_vy'>--</span> m/s</p>
+                
+
+                <h3 style="font-size: 1em; margin: 10px 0 5px 0; border-bottom: 1px dashed #dee2e6;">Quaternion (Robust Rotation)</h3>
+                <p style="font-size: 0.9em; margin-bottom: 5px;">Qw: <span class='value' id='qw'>--</span> | Qx: <span class='value' id='qx'>--</span> | Qy: <span class='value' id='qy'>--</span> | Qz: <span class='value' id='qz'>--</span></p>
+
+
+                <h3 style="font-size: 1em; margin: 10px 0 5px 0; border-bottom: 1px dashed #dee2e6;">Movement & Raw Data (X, Y, Z)</h3>
+                
+                <p style="margin-bottom: 5px;">Lin Accel (m/s&sup2;): <span class='value' id='lax'>--</span> | <span class='value' id='lay'>--</span> | <span class='value' id='laz'>--</span></p>
+                
+                <p style="margin-bottom: 5px;">Raw Accel (m/s&sup2;): <span class='value' id='ax'>--</span> | <span class='value' id='ay'>--</span> | <span class='value' id='az'>--</span> <span style='color:#007bff; font-weight:bold;'>[Mag: <span id='amag'>--</span>]</span></p>
+                <p style="margin-bottom: 5px;">Gyro (dps): <span class='value' id='gx'>--</span> | <span class='value' id='gy'>--</span> | <span class='value' id='gz'>--</span></p>
+                <p>Magnet (uT): <span class='value' id='mx'>--</span> | <span class='value' id='my'>--</span> | <span class='value' id='mz'>--</span></p>
+            </div>
+
+            <div class="data-box">
+                <h2>NEO-6M GPS</h2>
+                <p>Lat: <span class='value' id='lat_val'>--</span>, Lng: <span class='value' id='lng_val'>--</span></p>
+                <p>Altitude: <span class='value' id='alt_val'>--</span> m</p>
+                <p>Time: <span class='value' id='time_val'>--</span> | Date: <span class='value' id='date_val'>--</span></p>
+            </div>
+            
+        </div>
+        
+    </div>
+    
+    <!-- NEW: Team Details Modal -->
+    <div id="teamDetailsModal" class="modal">
+        <div class="modal-content">
+            <span class="close" onclick="toggleDetails()">&times;</span>
+            <h3 style="text-align: center; color: #007bff;">TEAM 5 DETAILS</h3>
+            <p style="text-align: left;"><strong>Members:</strong></p>
+            <ul style="text-align: left; list-style-type: disc; margin-left: 20px;">
+                <li>Annamalai Vairavan : Ultrasonic Sensor</li>
+                <li>Arun Periyakaruppan : Lidar Detection</li>
+                <li>Jyothi Joseph : GPS</li>
+                <li>Mohammed Moinuddin : IMU</li>
+                <li>Rahul Dhanasekaran : Cam and Webpage</li>
+                <li>Varghesekutty John : OLED Display</li>
+            </ul>
+        </div>
+    </div>
+
+    <script>
+        // --- Polling Rates for Stability ---
+        const POLLING_RATE_FAST = 500; 
+        const POLLING_RATE_SLOW = 500;  
+
+        // --- Constants ---
+        const maxRange=200;  
+        const MAX_LIDAR_RANGE_MM_CLIENT = 12000;  
+        const orientationCube = document.getElementById('orientation-cube');
+        const detailsModal = document.getElementById('teamDetailsModal');
+        
+        let yawOffsetDegrees = 0.0;
+        let ultrasonicData = {};  
+        
+        // --- Utility Functions ---
+
+        function setCalStatus(id, val) {
+            const el = document.getElementById(id);
+            el.innerText = val;
+            let className = 'cal-red';
+            if (val === 3) className = 'cal-green';
+            else if (val === 2) className = 'cal-yellow';
+            el.className = 'cal-status ' + className;
+        }
+        
+        // *CRITICAL FIX FUNCTION*: QUATERNION to CSS Rotation
+        function rotateCubeFromQuaternion(qw, qx, qy, qz) {
+            // Use defaults if data is undefined (robustness fix)
+            qw = qw || 1.0;
+            qx = qx || 0.0;
+            qy = qy || 0.0;
+            qz = qz || 0.0;
+
+            // This math converts the Quaternion (Q) into the Euler angles (Rad)
+            const rollRad = Math.atan2(2 * (qw * qx + qy * qz), 1 - 2 * (qx * qx + qy * qy));
+            const pitchRad = Math.asin(2 * (qw * qy - qz * qx));
+            const yawRad = Math.atan2(2 * (qw * qz + qx * qy), 1 - 2 * (qy * qy + qz * qz));
+
+            // Convert to Degrees
+            const rollDeg = rollRad * 180 / Math.PI;
+            const pitchDeg = pitchRad * 180 / Math.PI;
+            let yawDeg = yawRad * 180 / Math.PI; 
+            
+            // --- YAW OFFSET AND WRAP LOGIC ---
+            yawDeg = yawDeg - yawOffsetDegrees;
+            
+            if (yawDeg < 0) yawDeg = yawDeg + 360.0;
+            if (yawDeg > 360) yawDeg = yawDeg - 360.0;
+
+            // Apply transformation (Tuned for BNO055 and CSS 3D perspective)
+            // FIX: Invert the pitch rotation (X-axis) and Roll (Z-axis) for BNO055 / CSS compatibility
+            orientationCube.style.transform = 
+                `rotateX(${-pitchDeg}deg) rotateY(${yawDeg}deg) rotateZ(${-rollDeg}deg)`;
+
+            return yawDeg; 
+        }
+        
+        // NEW: Visual-Only Yaw Reset Function
+        function resetYaw() {
+            const currentRawHeading = parseFloat(document.getElementById('heading').innerText);
+            
+            yawOffsetDegrees = currentRawHeading;
+            
+            fetch('/resetYaw')
+                .then(response => response.text())
+                .then(message => {
+                    console.log("Visual Yaw Reset Complete. New Front is: " + currentRawHeading.toFixed(2) + " deg");
+                })
+                .catch(error => {
+                    console.error("Error communicating with server for Yaw reset.", error);
+                });
+        }
+        
+        // NEW: Dead Reckoning Reset Function
+        function resetDeadReckoning() {
+            fetch('/resetDR')
+                .then(response => response.text())
+                .then(message => {
+                    console.log("Dead Reckoning Reset Complete.");
+                })
+                .catch(error => {
+                    console.error("Error communicating with server for DR reset.", error);
+                });
+        }
+        
+        // NEW: Toggle Team Details Modal
+        function toggleDetails() {
+            detailsModal.style.display = detailsModal.style.display === "block" ? "none" : "block";
+        }
+        
+        // --- Combined Data Update Function (Hardened) ---
+        function updateAllData() {
+            fetch('/data')
+                .then(response => {
+                    if (!response.ok) {
+                        throw new Error('Network response was not ok: ' + response.status);
+                    }
+                    return response.json();
+                })
+                .then(data => {
+                    
+                    // 1. Ultrasonic Data: ONLY populate the global object for RADAR visualization
+                    ultrasonicData = {
+                        Front: data.Front,
+                        Deg45: data.Deg45,
+                        Right: data.Right,
+                        Back: data.Back,
+                        Left: data.Left
+                    };
+                    
+                    // 2. Robot Status / Control  
+                    document.getElementById('robot-mode').innerText = (data.mode || '--').replace('_', ' ');
+                    
+                    const robotStateEl = document.getElementById('robot-state');
+                    if (data.state === 'FREE_TO_GO') {
+                        robotStateEl.innerText = 'FREE TO GO';
+                        robotStateEl.style.color = '#28a745'; 
+                    } else if (data.state === 'STOPPED') {
+                        robotStateEl.innerText = 'STOPPED';
+                        robotStateEl.style.color = 'red';
+                    } else if (data.state === 'TURNING' || data.state === 'MOVING') {
+                        robotStateEl.innerText = data.state;
+                        robotStateEl.style.color = 'orange';
+                    } else {
+                        robotStateEl.innerText = data.state;
+                        robotStateEl.style.color = '#28a745';
+                    }
+                    
+                    document.getElementById('robot-direction').innerText = data.direction;
+
+                    // 3. Lidar Min/Quadrant Data  
+                    document.getElementById('lidar-mode-min').innerHTML = (data.lidar_min < MAX_LIDAR_RANGE_MM_CLIENT ? (data.lidar_min / 10).toFixed(1) + ' cm' : 'SAFE (>12m)');
+                    
+                    // 4. IMU Data  
+                    
+                    // 4.1 Calibration Status  
+                    setCalStatus('cal-sys', data.Cal_S);
+                    setCalStatus('cal-gyro', data.Cal_G);
+                    setCalStatus('cal-accel', data.Cal_A);
+                    setCalStatus('cal-mag', data.Cal_M);
+                    
+                    // 4.2 Fused Orientation (Euler Angles - FOR REFERENCE ONLY) 
+                    
+                    // CRITICAL CALL: Get the Yaw (Heading) for the cube, which returns the corrected display value
+                    const correctedHeading = rotateCubeFromQuaternion(data.Qw, data.Qx, data.Qy, data.Qz);
+                    
+                    // Display the corrected Yaw in the Heading field
+                    document.getElementById('heading').innerHTML = correctedHeading.toFixed(2); 
+                    
+                    // Display Roll/Pitch (No change needed, they don't have a yaw offset)
+                    document.getElementById('roll').innerHTML = (data.Roll || 0.0).toFixed(2);     
+                    document.getElementById('pitch').innerHTML = (data.Pitch || 0.0).toFixed(2);   
+                    
+                    // 4.3 Fused Quaternion (NEW)
+                    document.getElementById('qw').innerHTML = (data.Qw || 0.0).toFixed(4);
+                    document.getElementById('qx').innerHTML = (data.Qx || 0.0).toFixed(4);
+                    document.getElementById('qy').innerHTML = (data.Qy || 0.0).toFixed(4);
+                    document.getElementById('qz').innerHTML = (data.Qz || 0.0).toFixed(4);
+
+                    // 4.4 Raw Vectors 
+                    document.getElementById('lax').innerHTML = (data.LAX || 0.0).toFixed(2);
+                    document.getElementById('lay').innerHTML = (data.LAY || 0.0).toFixed(2);
+                    document.getElementById('laz').innerHTML = (data.LAZ || 0.0).toFixed(2);
+
+                    document.getElementById('ax').innerHTML = (data.AX || 0.0).toFixed(2);
+                    document.getElementById('ay').innerHTML = (data.AY || 0.0).toFixed(2);
+                    document.getElementById('az').innerHTML = (data.AZ || 0.0).toFixed(2);
+                    document.getElementById('amag').innerHTML = (data.AMag || 0.0).toFixed(2);  
+
+                    document.getElementById('gx').innerHTML = (data.GX || 0.0).toFixed(2);
+                    document.getElementById('gy').innerHTML = (data.GY || 0.0).toFixed(2);
+                    document.getElementById('gz').innerHTML = (data.GZ || 0.0).toFixed(2);
+                    
+                    // Magnetometer Fix
+                    document.getElementById('mx').innerHTML = (data.MX || 0.0).toFixed(2);
+                    document.getElementById('my').innerHTML = (data.MY || 0.0).toFixed(2);
+                    document.getElementById('mz').innerHTML = (data.MZ || 0.0).toFixed(2);
+                    
+                    // 4.5 Dead Reckoning (NEW)
+                    document.getElementById('dr_x').innerHTML = (data.DR_X || 0.0).toFixed(3);
+                    document.getElementById('dr_y').innerHTML = (data.DR_Y || 0.0).toFixed(3);
+                    document.getElementById('dr_vx').innerHTML = (data.DR_VX || 0.0).toFixed(3);
+                    document.getElementById('dr_vy').innerHTML = (data.DR_VY || 0.0).toFixed(3);
+
+
+                    // 5. GPS Data 
+                    const gpsFixed = (data.Latitude != 0.0);
+                    document.getElementById('lat_val').innerHTML = gpsFixed ? (data.Latitude || 0.0).toFixed(6) : '--';
+                    document.getElementById('lng_val').innerHTML = gpsFixed ? (data.Longitude || 0.0).toFixed(6) : '--';
+                    document.getElementById('alt_val').innerHTML = gpsFixed ? (data.Altitude || 0.0).toFixed(2) + ' m' : '--';
+
+                    document.getElementById('time_val').innerHTML = data.Time;
+                    document.getElementById('date_val').innerHTML = data.Date;
+                    
+                    // Update canvas on dark mode if needed
+                    if (document.body.classList.contains('dark-mode')) {
+                         drawPolarGrid(); // Redraw grid with dark mode colors
+                         drawScanPoints(lidarScanHistory);
+                         drawUltrasonicPoints(ultrasonicData);
+                    }
+                })
+                .catch(error => {  
+                    console.error('Error fetching/parsing data:', error);
+                });
+        }
+        
+        
+        // --- Lidar Visualization Functions (MODIFIED FOR COMBINED DISPLAY) ---
+        const canvas = document.getElementById('lidar-canvas');
+        const ctx = canvas.getContext('2d');
+        const CANVAS_SIZE = 420;  
+        const CENTER = CANVAS_SIZE / 2;
+        const VISUAL_RADIUS = 180;  
+        const VISUAL_RANGE_MM = 1000.0;  
+        let lidarScanHistory = Array(360).fill({d: VISUAL_RANGE_MM, age: 0});  
+        const MAX_AGE = 10;  
+
+        
+        // --- FUNCTION: Draws the 5 Ultrasonic Points (Kept for radar visualization) ---
+        function drawUltrasonicPoints(data) {
+            const scaleFactor = VISUAL_RADIUS / VISUAL_RANGE_MM;  
+            // Use explicit blue for Ultrasonic points
+            ctx.fillStyle = document.body.classList.contains('dark-mode') ? '#03a9f4' : 'blue'; 
+            
+            // Map ALL 5 Ultrasonic sensor locations to their corresponding radar angle
+            const ultraPoints = [
+                { angle: 0, dist: data.Front },      
+                { angle: 45, dist: data.Deg45 },     
+                { angle: 90, dist: data.Right },     
+                { angle: 180, dist: data.Back },     
+                { angle: 270, dist: data.Left }      
+            ];
+            
+            const MAX_ULTRASONIC_VISUAL_CM = 50;
+            
+            ultraPoints.forEach(point => {
+                const distanceCM = point.dist;
+                
+                if (distanceCM > 0 && distanceCM <= MAX_ULTRASONIC_VISUAL_CM) {  
+                    const distanceMM = distanceCM * 10; 
+                    const angle = point.angle;
+                    const angleRad = (angle - 90) * Math.PI / 180;  
+                    const distPx = distanceMM * scaleFactor;  
+                    
+                    const x = CENTER + distPx * Math.cos(angleRad);  
+                    const y = CENTER + distPx * Math.sin(angleRad);  
+
+                    ctx.beginPath();
+                    ctx.arc(x, y, 5, 0, 2 * Math.PI); 
+                    ctx.fill();
+                }
+            });
+        }
+        // -------------------------------------------------------------------
+
+        function drawPolarGrid() {
+            const isDarkMode = document.body.classList.contains('dark-mode');
+            const primaryColor = isDarkMode ? '#e0e0e0' : '#343a40';
+            const secondaryColor = isDarkMode ? '#444' : '#6c757d';
+            const tertiaryColor = isDarkMode ? '#333' : '#adb5bd';
+            const centerColor = isDarkMode ? '#ffeb3b' : 'yellow';
+            const boundaryColor = isDarkMode ? '#03a9f4' : '#007bff';
+            const bgColor = isDarkMode ? '#1e1e1e' : '#fff';
+            
+            ctx.clearRect(0, 0, CANVAS_SIZE, CANVAS_SIZE);
+            ctx.fillStyle = bgColor;
+            ctx.fillRect(0, 0, CANVAS_SIZE, CANVAS_SIZE);
+            
+            ctx.beginPath();
+            ctx.arc(CENTER, CENTER, VISUAL_RADIUS, 0, 2 * Math.PI);
+            ctx.strokeStyle = secondaryColor;
+            ctx.stroke();
+
+            // Draw spokes and labels (Degrees/Cardinal Directions)
+            for (let i = 0; i < 360; i += 30) {
+                const rad = (i - 90) * Math.PI / 180;  
+                ctx.beginPath();
+                ctx.moveTo(CENTER, CENTER);
+                ctx.lineTo(CENTER + VISUAL_RADIUS * Math.cos(rad), CENTER + VISUAL_RADIUS * Math.sin(rad));
+                ctx.strokeStyle = tertiaryColor;  
+                ctx.stroke();
+
+                const isCardinal = (i % 90 === 0);
+                
+                if (isCardinal) {
+                    let labelText = '';
+                    if (i === 0) labelText = 'FRONT';
+                    else if (i === 90) labelText = 'RIGHT';
+                    else if (i === 180) labelText = 'BACK';
+                    else if (i === 270) labelText = 'LEFT';
+                    
+                    ctx.fillStyle = primaryColor; 
+                    ctx.font = '12px Arial';
+                    
+                    const labelX = CENTER + (VISUAL_RADIUS + 15) * Math.cos(rad);
+                    const labelY = CENTER + (VISUAL_RADIUS + 15) * Math.sin(rad);
+                    
+                    if (i === 0) ctx.textAlign = 'center';
+                    else if (i === 90) ctx.textAlign = 'left';
+                    else if (i === 180) ctx.textAlign = 'center';
+                    else if (i === 270) ctx.textAlign = 'right';
+
+                    ctx.fillText(labelText, labelX, labelY + 4);
+                }
+            }
+
+            // Draw rings and labels (CM - Modified for 100cm range with 50cm boundary)
+            const numRings = 3;  
+            const maxRangeCM = VISUAL_RANGE_MM / 10; // 100cm
+            
+            for (let i = 1; i <= numRings; i++) {
+                const ringCm = maxRangeCM * (i / numRings);
+                const radius = VISUAL_RADIUS * (i / numRings);
+
+                ctx.beginPath();
+                ctx.arc(CENTER, CENTER, radius, 0, 2 * Math.PI);
+
+                if (i === 1 || i === 2) { 
+                    ctx.strokeStyle = tertiaryColor;  
+                    ctx.lineWidth = 1;
+                    ctx.setLineDash([2, 2]);
+                } else { 
+                    ctx.strokeStyle = secondaryColor;  
+                    ctx.lineWidth = 1;
+                    ctx.setLineDash([]);
+                }
+                ctx.stroke();
+
+                let labelCm = ringCm.toFixed(0);
+                ctx.fillStyle = primaryColor;
+                ctx.font = '10px Arial';
+                ctx.textAlign = 'center';
+                ctx.setLineDash([]);  
+                ctx.fillText(labelCm + 'cm', CENTER, CENTER - radius + 10);
+            }
+
+            // Explicitly draw the 50cm boundary (half the total visual radius)
+            const boundaryRadius = VISUAL_RADIUS * (50 / 100);
+            ctx.beginPath();
+            ctx.arc(CENTER, CENTER, boundaryRadius, 0, 2 * Math.PI);
+            ctx.strokeStyle = boundaryColor; 
+            ctx.lineWidth = 2;
+            ctx.setLineDash([]);
+            ctx.stroke();
+
+            // Draw Center point
+            ctx.beginPath();
+            ctx.arc(CENTER, CENTER, 4, 0, 2 * Math.PI);
+            ctx.fillStyle = centerColor;  
+            ctx.fill();
+            ctx.strokeStyle = primaryColor;
+            ctx.stroke();
+        }
+
+        function drawScanPoints(history) {
+            const scaleFactor = VISUAL_RADIUS / VISUAL_RANGE_MM;  
+            // Use explicit red for Lidar points
+            ctx.fillStyle = document.body.classList.contains('dark-mode') ? '#ff8a80' : 'red';  
+            
+            const MIN_LIDAR_VISUAL_MM = 500; // 50 cm
+            
+            history.forEach((point, angleIndex) => {
+                const distance = point.d; 
+
+                if (distance > MIN_LIDAR_VISUAL_MM && distance <= VISUAL_RANGE_MM) {
+                    const angle = angleIndex;  
+                    const angleRad = (angle - 90) * Math.PI / 180;  
+                    const distPx = distance * scaleFactor;  
+                    const x = CENTER + distPx * Math.cos(angleRad);  
+                    const y = CENTER + distPx * Math.sin(angleRad);  
+
+                    ctx.beginPath();
+                    ctx.arc(x, y, 3, 0, 2 * Math.PI);
+                    ctx.fill();
+                }
+            });
+        }
+        
+        function updateLidarData() {
+            fetch('/lidarjson')  
+                .then(response => {  
+                    if (!response.ok) throw new Error('HTTP Error: ' + response.status);  
+                    return response.json();  
+                })
+                .then(data => {
+                    const newScanPoints = {};
+                    if (data.scan && Array.isArray(data.scan)) {
+                        data.scan.forEach(point => {
+                            const angle = Math.round(point.a) % 360;  
+                            if (point.d > 0 && point.d < VISUAL_RANGE_MM) {  
+                                if (!newScanPoints[angle] || point.d < newScanPoints[angle].d) {
+                                    newScanPoints[angle] = {d: point.d, age: MAX_AGE};  
+                                }
+                            }
+                        });
+                    }
+
+                    for(const angle in newScanPoints) {
+                        const newPoint = newScanPoints[angle];
+                        const oldPoint = lidarScanHistory[angle];
+                        if (newPoint.d < oldPoint.d || oldPoint.age <= 0) {
+                            lidarScanHistory[angle] = newPoint;
+                        }
+                    }
+                    
+                    for (let i = 0; i < 360; i++) {
+                        if (lidarScanHistory[i].age > 0) {
+                            lidarScanHistory[i].age--;
+                        } else {
+                            lidarScanHistory[i].d = VISUAL_RANGE_MM; 
+                        }
+                    }
+
+                    drawPolarGrid();
+                    drawScanPoints(lidarScanHistory);
+                    
+                    drawUltrasonicPoints(ultrasonicData);
+
+                })
+                .catch(error => {
+                    console.error('Lidar Fetch Error:', error);
+                    drawPolarGrid();
+                    drawUltrasonicPoints(ultrasonicData);
+                });
+        }
+        
+        // --- DARK MODE LOGIC (NEW) ---
+        function toggleDarkMode() {
+            document.body.classList.toggle('dark-mode');
+            const isDarkMode = document.body.classList.contains('dark-mode');
+            localStorage.setItem('darkMode', isDarkMode ? 'enabled' : 'disabled');
+            // Re-draw canvas for potential color changes
+            drawPolarGrid();
+            drawScanPoints(lidarScanHistory);
+            drawUltrasonicPoints(ultrasonicData);
+        }
+        
+        // NEW: Toggle Team Details Modal
+        function toggleDetails() {
+            detailsModal.style.display = detailsModal.style.display === "block" ? "none" : "block";
+        }
+
+        document.addEventListener('DOMContentLoaded', () => {
+            document.getElementById("ip-address").innerText = window.location.host;
+            
+            // Event listener for the new button
+            document.getElementById('team-details-button').addEventListener('click', toggleDetails);
+            
+            // Set initial theme based on localStorage
+            if (localStorage.getItem('darkMode') === 'enabled') {
+                document.body.classList.add('dark-mode');
+            }
+            document.getElementById('dark-mode-toggle').addEventListener('click', toggleDarkMode);
+            
+            drawPolarGrid();  
+            
+            // Initial calls
+            updateAllData();
+            updateLidarData();
+            
+            // Set stable polling rates
+            setInterval(updateAllData, POLLING_RATE_FAST);  
+            setInterval(updateLidarData, POLLING_RATE_SLOW);  
+        });
+    </script>
+)rawliteral";
+  
+  // Replace placeholders in the HTML
+  String finalHtml = String(htmlContent);
+  finalHtml.replace("%IP_ADDRESS%", WiFi.localIP().toString());
+  finalHtml.replace("%CAMERA_ADDRESS%", camAddress);
+  server.send(200, "text/html", finalHtml);
+}
+
+
+// ===================================================
+// === SETUP & LOOP (MODIFIED) ===
+// ===================================================
+
+void setup() {
+  Serial.begin(115200);  
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+
+  // --- 1. SENSOR PIN SETUP (RESTORED ALL US PINS) ---
+  pinMode(TRIG_FRONT, OUTPUT); pinMode(ECHO_FRONT, INPUT);
+  pinMode(TRIG_BACK, OUTPUT); pinMode(ECHO_BACK, INPUT);
+  pinMode(TRIG_LEFT, OUTPUT); pinMode(ECHO_LEFT, INPUT);
+  pinMode(TRIG_RIGHT, OUTPUT); pinMode(ECHO_RIGHT, INPUT);
+  pinMode(TRIG_45DEG, OUTPUT); pinMode(ECHO_45DEG, INPUT);
+  Serial.println("✅ Ultrasonic Sensor Pins Initialized.");
+  
+  // --- 2. IMU & I2C Setup ---
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN); // Initialize I2C bus for BNO055 and OLED
+  if(bno.begin()) {
+    bno_initialized = true;
+    delay(1000);    
+    // Set initial target heading to current heading on boot
+    targetHeading = bno.getVector(Adafruit_BNO055::VECTOR_EULER).x(); 
+    Serial.println("✅ BNO055 IMU initialized.");
+  } else {
+    Serial.println("❌ BNO055 IMU failed. Check power/address.");
+  }
+
+  // --- 2b. OLED Final Initialization (After Wire.begin) (2.1) ---
+  if(!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
+    Serial.println("❌ SSD1306 OLED allocation failed / not found. Check address/wiring.");
+  } else {
+    display.clearDisplay();
+    display.setTextSize(2); // Use size 2 for the new 2-line welcome
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 0); // Line 1
+    display.println("WELCOME");
+    display.setCursor(0, 16); // Line 2
+    display.println("TEAM 5"); 
+    display.display();
+    
+    oledDisplayTimeout = millis() + 10000; // Show "WELCOME TEAM 5" for 10 seconds
+    oledStatusMessage = "WELCOME BY TEAM 5"; // Special string to trigger custom 2-line logic
+    Serial.println("✅ SSD1306 OLED initialized.");
+  }
+
+
+  // --- 3. GPS Setup ---
+  gpsSerial.begin(GPSBaud, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+  Serial.printf("✅ NEO-6M GPS initialized on RX:%d / TX:%d at %d baud.\n", GPS_RX_PIN, GPS_TX_PIN, GPSBaud);
+  
+  // --- 4. LIDAR Setup ---
+  pinMode(MOTOR_PIN, OUTPUT);  
+  lidarSerial.begin(LIDAR_BAUDRATE, SERIAL_8N1, LIDAR_RX_PIN, LIDAR_TX_PIN);
+  startLidarMotor();  
+  
+  // Initialize LIDAR smoothing buffer
+  for (int i = 0; i < LIDAR_SMOOTH_WINDOW; i++) lidarSmoothBuffer[i] = MAX_LIDAR_RANGE_MM;
+  
+  Serial.printf("✅ RAW Lidar initialized on RX:%d / TX:%d at %d baud.\n", LIDAR_RX_PIN, LIDAR_TX_PIN, LIDAR_BAUDRATE);
+
+  // --- 5. WIFI & ESP-NOW Setup ---
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password); // Connect to the CAM's AP
+  Serial.println("🔧 Connecting WiFi to CAM AP...");
+  
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  
+  // --- ROBUST IP ADDRESS OUTPUT ---
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n✅ Connected to CAM AP.");
+    Serial.print("Master Dashboard IP: http://"); Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("\n❌ Failed to connect to CAM AP. Check credentials/power.");
+  }
+  
+  if (esp_now_init() == ESP_OK) {
+    esp_now_register_recv_cb(OnDataRecv);
+    Serial.println("✅ ESP-NOW Receiver ready.");
+  } else {
+    Serial.println("❌ ESP-NOW init failed!");
+  }
+
+  // --- 6. Web Server Setup ---
+  server.on("/", handleRoot);
+  server.on("/data", HTTP_GET, handleData);      
+  server.on("/lidarjson", handleLidarJson);
+  server.on("/resetYaw", handleYawReset); // Yaw Reset Endpoint
+  server.on("/resetDR", handleDRReset);   // NEW: Dead Reckoning Reset Endpoint
+  server.begin();
+  Serial.println("✅ Web Server started!");
+  
+  Serial.println("\n**");
+  Serial.println("     MASTER DASHBOARD URL: ");  
+  Serial.print("     http://"); Serial.print(WiFi.localIP()); Serial.println("/");
+  Serial.println("\n");
+  
+  // Initialize Dead Reckoning last update time
+  lastDRUpdate = millis();
+}
+
+
+// === NON-BLOCKING LOOP IMPLEMENTATION & CONTROL LOGIC (MODIFIED) ===
+void loop() {
+  server.handleClient();
+  readIMU();  
+  readGPS();  
+  
+  // NEW: Dead Reckoning Update
+  updateDeadReckoning(); 
+  
+  // 1. Update OLED Display on every loop iteration to manage timeouts
+  updateOLED();  
+
+  // 2. Only read sensors when the interval has passed (non-blocking)
+  if (millis() - lastUSRead >= US_INTERVAL) {
+    lastUSRead = millis();
+    readAllUltrasonicSensors(); // Reads all 5 sensors now
+    
+    // 3. IMPLEMENT CONTROL LOGIC
+
+    // --- Declarations ---
+    // Define blockage status for all US sensors (50cm is the Lidar/US boundary)
+    bool usFrontClose = (distFront < 50);  
+    bool usDeg45Close = (distDeg45 < 50);  
+    bool usLeftClose = (distLeft < 50);
+    bool usRightClose = (distRight < 50);  
+    bool usBackClose = (distBack < 50);
+    
+    // Check if ALL US sensors are clear (for Lidar mode switch)
+    bool allUsClear = !usFrontClose && !usDeg45Close && !usLeftClose && !usRightClose && !usBackClose;
+
+    // Define "very close" for emergency stop (10cm)
+    bool frontVeryClose = (distFront <= 10);  
+    bool deg45VeryClose = (distDeg45 <= 10);  
+    bool leftVeryClose = (distLeft <= 10);
+    bool rightVeryClose = (distRight <= 10);  
+    bool backVeryClose = (distBack <= 10);
+    
+    // Count how many front-facing sensors are "very close" (<= 10cm)
+    int veryCloseCount = frontVeryClose + deg45VeryClose; 
+    
+    // Check if ANY sensor (front, sides, back) is very close (<= 10cm)
+    bool anyUsVeryClose = frontVeryClose || deg45VeryClose || leftVeryClose || rightVeryClose || backVeryClose;
+    // --------------------------------------------------------------------------
+
+
+    // --- Mode Switching: Lidar -> US ---
+    // Mode Switch to Lidar if in FREE_TO_GO state AND all US sensors report a clear path (> 50cm).
+    if (currentState == MOVING && currentDirection.startsWith("Forward") && allUsClear) {  
+        currentMode = LIDAR_MODE;
+    }  
+    // Switch to US Mode if Lidar detects an obstacle (50cm or less) OR if US detected something close
+    else if (globalMinLidarDist <= 500 || !allUsClear) {  
+        currentMode = ULTRASONIC_MODE;
+    }
+    
+    // --- Action Logic: US Sensor Trigger (Only in ULTRASONIC_MODE) ---
+    if (currentMode == ULTRASONIC_MODE) {
+
+        // CRITICAL CHANGE 1 (Highest Priority): Emergency U-Turn if 2 or more front-facing sensors are <= 10cm
+        if (veryCloseCount >= 2) {
+            currentState = STOPPED;
+            currentDirection = "Reverse"; // U-Turn
+        }
+        
+        // CRITICAL CHANGE 2 (Second Priority): Stop/Reverse if ANY single sensor (front, sides, back) is very close (<= 10cm)
+        else if (anyUsVeryClose) {  
+            currentState = STOPPED;
+            currentDirection = "Reverse";  
+        }
+
+        // --- SIMPLIFIED DIRECTIONAL LOGIC (10cm < distance < 50cm) ---
+        
+        // Blocked Front/Front-Diagonal: Stop and Reverse
+        else if (usFrontClose || usDeg45Close) {
+            currentState = STOPPED;
+            currentDirection = "Reverse";
+        }
+        
+        // Blocked Back: Stop and Forward
+        else if (usBackClose) {
+            currentState = STOPPED;
+            currentDirection = "Forward";
+        }
+
+        // Blocked Left Side: Turn Right (Opposite of Left)
+        else if (usLeftClose) {
+            currentState = TURNING;
+            currentDirection = "Right";  
+            // --- NEW IMU CONTROL LOGIC: Set a new target heading for a 45-degree turn right ---
+            targetHeading = fmod(currentHeading + 45.0f, 360.0f);
+        }
+        
+        // Blocked Right Side: Turn Left (Opposite of Right)
+        else if (usRightClose) {  
+            currentState = TURNING;
+            currentDirection = "Left";
+            // --- NEW IMU CONTROL LOGIC: Set a new target heading for a 45-degree turn left ---
+            targetHeading = fmod(currentHeading - 45.0f + 360.0f, 360.0f); // Add 360 for safe modulo with negative result
+        }  
+        
+        // --- FALLBACK / HEADING CORRECTION LOGIC (Only if safe path) ---
+        else {
+            
+            // Calculate the heading error (how far off we are from the targetHeading)
+            float headingError = calculateTurnCorrection(currentHeading, targetHeading);
+            
+            // Check if we are currently turning
+            if (currentState == TURNING) {
+                
+                // Check if the desired turn is complete (e.g., within 5 degrees)
+                if (abs(headingError) < 5.0f) { 
+                    // Turn is complete. Reset to MOVING and set new targetHeading to current heading
+                    currentState = MOVING;
+                    currentDirection = "Forward";
+                    targetHeading = currentHeading; // Lock onto the new direction
+                } else {
+                    // Turn is NOT complete. Keep turning in the direction set above (Right or Left).
+                }
+            }
+            
+            // Default to MOVING FORWARD if safe and not currently turning
+            else if (currentState == MOVING || currentState == STOPPED) {
+                
+                // Reset to MOVING if we were STOPPED by an old US error that has cleared
+                if (currentState == STOPPED) {
+                    currentState = MOVING;
+                    // Note: currentDirection keeps its value from the last move/turn command
+                }
+                
+                // Check for minor drift correction (always try to maintain targetHeading)
+                if (abs(headingError) >= 2.0f) { // If drifted by more than 2 degrees
+                    // This is a subtle correction, still considered "MOVING"
+                    if (headingError > 0) {
+                         currentDirection = "Right-Correct"; 
+                    } else {
+                         currentDirection = "Left-Correct";
+                    }
+                } else {
+                    // If drift is minimal, ensure the state is fully forward
+                    currentDirection = "Forward";
+                }
+            }
+        }
+    }
+  }
+}
