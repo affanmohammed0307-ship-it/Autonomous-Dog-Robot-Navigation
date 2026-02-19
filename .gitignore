@@ -1,0 +1,23 @@
+# OS files
+.DS_Store
+Thumbs.db
+
+# Arduino build files
+*.hex
+*.elf
+*.bin
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Logs
+*.log
+
+# VS Code
+.vscode/
+
+# Temporary files
+*.tmp
+*.temp
