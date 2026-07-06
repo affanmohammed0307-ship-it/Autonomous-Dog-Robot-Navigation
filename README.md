@@ -26,7 +26,7 @@ https://github.com/user-attachments/assets/bd1c0b8b-896e-45a3-93ff-430b2bee3cac
 
 
 
-https://github.com/user-attachments/assets/37021e00-36bc-4d67-9208-6acbde53766a
+
 
 ## What it does
 - Autonomous point-to-point campus navigation using sensor fusion
