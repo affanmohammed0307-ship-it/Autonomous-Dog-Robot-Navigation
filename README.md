@@ -1,13 +1,3 @@
-
-
-
-
-
-
-
-
-
-
 # Autonomous Dog Robot Navigation
 
 Campus autonomous navigation system for a quadruped robot using 
@@ -15,14 +5,11 @@ ESP32, multi-sensor fusion, and a web-based mission control interface.
 
 
 
-https://github.com/user-attachments/assets/bd1c0b8b-896e-45a3-93ff-430b2bee3cac
+https://github.com/user-attachments/assets/5d3ff2ec-d9e1-4a94-8dbf-88f7e97d8bda
 
 
 
-
-
-
-
+https://github.com/user-attachments/assets/32be5398-23ae-4a6f-a97f-f7d994b59907
 
 
 
