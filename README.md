@@ -3,9 +3,9 @@
 Campus autonomous navigation system for a quadruped robot using 
 ESP32, multi-sensor fusion, and a web-based mission control interface.
 
-## Demo
 
 
+https://github.com/user-attachments/assets/bd1c0b8b-896e-45a3-93ff-430b2bee3cac
 
 ## What it does
 - Autonomous point-to-point campus navigation using sensor fusion
