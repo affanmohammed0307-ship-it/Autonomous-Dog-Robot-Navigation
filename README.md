@@ -1,32 +1,53 @@
+# Autonomous Dog Robot Navigation
+
+Campus autonomous navigation system for a quadruped robot using 
+ESP32, multi-sensor fusion, and a web-based mission control interface.
+
+## Demo
 
 
-https://github.com/user-attachments/assets/4d9b1e94-e2e3-4042-be28-08845a11f739
 
+## What it does
+- Autonomous point-to-point campus navigation using sensor fusion
+- Web interface with mission commands: Go to B Building, Go to H Building, Stop
+- Real-time obstacle detection and avoidance using LiDAR and Ultrasonic sensors
+- GPS-based outdoor localization combined with IMU orientation tracking
+- Hijack module architecture — plugs into existing robot hardware without modifying it
 
+## Hardware
+| Sensor | Purpose |
+|---|---|
+| 2D LiDAR | Obstacle detection and mapping |
+| Ultrasonic | Close-range proximity detection |
+| Camera (ESP32-CAM) | Visual feed |
+| IMU (BNO055) | Orientation and motion tracking |
+| GPS | Outdoor localization |
+| ESP32 Dev Module | Navigation logic and motor control |
+| ESP32 CAM Module | Camera feed |
 
-# Autonomous Quadruped (Dog Robot) Navigation Stack 🐕🤖
+## Software Architecture
+```
+Web Interface (Mission Commands)
+        ↓
+ESP32 Dev — Navigation Controller (RobotNav.ino)
+        ↓
+Sensor Fusion (LiDAR + Ultrasonic + IMU + GPS)
+        ↓
+Path Planning → Motor Commands → Robot Motion
+```
 
-## 🎯 Project Overview
-This project implements a high-performance navigation and path-planning pipeline for a quadruped robot. The system utilizes an **ESP32-based** architecture to perform real-time sensor fusion and environment mapping, enabling autonomous decision-making on resource-constrained hardware.
+## Key Files
+- `RobotNav.ino` — Main navigation logic, sensor fusion, path planning
+- `Controller.h` — Motor control and hardware abstraction layer
+- `CAS_Cam_code` — ESP32-CAM firmware for visual feed
+- `BNO055_Sensor_Integration1.txt` — IMU integration notes
+- `FINAL_PATH.txt` — Waypoint definitions for campus navigation
 
-## 🚀 Key Technical Features
-- **High-Precision Sensor Fusion:** Integrated the **Bosch BNO055 9-axis IMU** for absolute orientation and motion tracking.
-- **Embedded Perception:** Utilized **ESP32-CAM** for real-time visual data acquisition and environment awareness.
-- **Hybrid Processing Pipeline:** Developed a dual-layer communication stack (C++ on the edge, Python for high-level data processing) to manage real-time path planning.
-- **Signal Filtering:** Implemented Kalman/Complementary filters to minimize sensor noise and drift during dynamic locomotion.
+## How to run
+1. Flash `RobotNav.ino` to ESP32 Dev module via Arduino IDE
+2. Flash `CAS_Cam_code` to ESP32-CAM module
+3. Power on the robot and connect to the web interface
+4. Select mission: Go to B Building / Go to H Building / Stop
 
-## 🛠️ Hardware & Software Stack
-- **Microcontroller:** ESP32-DevKit, ESP32-CAM (Dual-Core 240MHz)
-- **Primary Sensor:** Bosch BNO055 (Absolute Orientation Sensor via I2C)
-- **Languages:** C++ (Embedded), Python (Backend & Visualization)
-- **Communication:** I2C, UART, Serial Data Streaming
-- **Tools:** Arduino IDE, VS Code, Git
-
-## 📂 System Architecture
-1. **Perception Layer:** Continuous polling of the BNO055 and Camera feed.
-2. **Navigation Logic:** On-device path calculation using simplified kinematic models.
-3. **Execution Layer:** PWM-based motor/servo control for stable gait execution.
-4. **Telemetry:** Real-time data logging to Python for performance analysis and path visualization.
-
----
-*Developed as part of the Master's in Mechatronics and CPS at DIT Deggendorf.*
+## Built with
+Arduino IDE · ESP32 · BNO055 IMU · LiDAR · GPS · C++
